@@ -43,7 +43,7 @@ lambda_stack:
   project_config:
     vpc_id: "<VPC_ID>"         # VPC ID for deploying the Lambda function.
     bucket_layer_name: "lambda-layer-ap-southeast-1-771555507582"  # S3 bucket name containing Lambda layers.
-    lambda_function_name: "test-dynamic-lambda"   # Name of the Lambda function.
+    lambda_function_name: "<LAMBDA_NAME>"   # Name of the Lambda function.
     code_from_asset: "_lambda"              # Directory containing the Lambda function code.
     function_handler: "lambda_function.lambda_handler"  # Lambda handler (file.function).
     memory_size: 256                        # Memory (MB) allocated to the Lambda function.
