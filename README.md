@@ -30,9 +30,9 @@ The `env.yaml` file contains configuration details, such as AWS account settings
 
 ```yaml
 # Global AWS settings
-aws_account_id: "771555507582"           # Your AWS account ID.
-aws_region: "ap-southeast-1"              # AWS region for deployment.
-project_tag: "EI-CarbonWatch"             # Project tag for resource tagging.
+aws_account_id: "<AWS_ACCOUNT_ID>"           # Your AWS account ID.
+aws_region: "<AWS_REGION>"              # AWS region for deployment.
+project_tag: "EI-<PROJECT_NAME>"             # Project tag for resource tagging.
 environment_tag: "dev"                    # Environment tag (e.g., dev, prod).
 
 ###########################
@@ -41,7 +41,7 @@ environment_tag: "dev"                    # Environment tag (e.g., dev, prod).
 lambda_stack:
   stack_name: "DynamicLambdaStack"        # Name of the CloudFormation stack for Lambda.
   project_config:
-    vpc_id: "vpc-0b0c789397b306f2c"         # VPC ID for deploying the Lambda function.
+    vpc_id: "<VPC_ID>"         # VPC ID for deploying the Lambda function.
     bucket_layer_name: "lambda-layer-ap-southeast-1-771555507582"  # S3 bucket name containing Lambda layers.
     lambda_function_name: "test-dynamic-lambda"   # Name of the Lambda function.
     code_from_asset: "_lambda"              # Directory containing the Lambda function code.
