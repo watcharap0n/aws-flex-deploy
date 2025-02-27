@@ -30,9 +30,9 @@ The `env.yaml` file contains configuration details, such as AWS account settings
 
 ```yaml
 # Global AWS settings
-aws_account_id: "<AWS_ACCOUNT_ID>"           # Your AWS account ID.
-aws_region: "<AWS_REGION>"              # AWS region for deployment.
-project_tag: "EI-<PROJECT_NAME>"             # Project tag for resource tagging.
+aws_account_id: "771555507582"           # Your AWS account ID.
+aws_region: "ap-southeast-1"              # AWS region for deployment.
+project_tag: "EI-CarbonWatch"             # Project tag for resource tagging.
 environment_tag: "dev"                    # Environment tag (e.g., dev, prod).
 
 ###########################
@@ -41,52 +41,59 @@ environment_tag: "dev"                    # Environment tag (e.g., dev, prod).
 lambda_stack:
   stack_name: "DynamicLambdaStack"        # Name of the CloudFormation stack for Lambda.
   project_config:
-    vpc_id: "<VPC_ID>"         # VPC ID for deploying the Lambda function.
+    vpc_id: "vpc-0b0c789397b306f2c"         # VPC ID for deploying the Lambda function.
     bucket_layer_name: "lambda-layer-ap-southeast-1-771555507582"  # S3 bucket name containing Lambda layers.
-    lambda_function_name: "<LAMBDA_NAME>"   # Name of the Lambda function.
+    lambda_function_name: "test-dynamic-lambda"   # Name of the Lambda function.
     code_from_asset: "_lambda"              # Directory containing the Lambda function code.
     function_handler: "lambda_function.lambda_handler"  # Lambda handler (file.function).
     memory_size: 256                        # Memory (MB) allocated to the Lambda function.
     ephemeral_storage_size: 1024            # Ephemeral storage size (MB) for the Lambda.
     environments:
       ENV_VAR: "value"                      # Environment variables for the Lambda function.
-    layers:                                 # List of Lambda layers (from S3).
-      - id: "Geoalchemy2Layer"              
-        key: "geoalchemy2.zip"              
-      - id: "GeopandasLayer"                
-        key: "geopandas.zip"                
-      - id: "Psycopg2Layer"                 
-        key: "psycopg2-binary.zip"          
-      - id: "PydanticV2Layer"               
-        key: "pydantic-v2.zip"              
-    role:                                   # IAM Role configuration for the Lambda.
+      S3_BUCKET: "my-bucket"                # Example environment variable.
+    layers: # List of Lambda layers (from S3).
+      - id: "Geoalchemy2Layer"
+        key: "geoalchemy2.zip"
+      - id: "GeopandasLayer"
+        key: "geopandas.zip"
+      - id: "Psycopg2Layer"
+        key: "psycopg2-binary.zip"
+      - id: "PydanticV2Layer"
+        key: "pydantic-v2.zip"
+    role: # IAM Role configuration for the Lambda.
       assumed_by: "lambda.amazonaws.com"    # Principal that can assume this role.
       role_name: "IamRoleLambdaDynamic"     # Name of the IAM role.
-      ids:                                  # Identifiers for the managed policies.
+      ids: # Identifiers for the managed policies.
         - "PolicyBasic"
         - "PolicyS3"
         - "PolicyNetwork"
         - "PolicySecret"
         - "PolicySagemaker"
         - "PolicySES"
-      managed_policy_arns:                  # ARNs for the managed policies to attach.
+      managed_policy_arns: # ARNs for the managed policies to attach.
         - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
         - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
         - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
         - "arn:aws:iam::aws:policy/SecretsManagerReadWrite"
         - "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
         - "arn:aws:iam::aws:policy/AmazonSESFullAccess"
-    security_group:                         # Security group settings for the Lambda.
+    security_group: # Security group settings for the Lambda.
       name: "LambdaSecurityGroupDynamicV2"    # Name of the security group.
       description: "Custom SG for Lambda functions"  # Description.
       allow_all_outbound: true                # Allow all outbound traffic.
-      ingress_rules:                          # List of ingress (inbound) rules.
+      ingress_rules: # List of ingress (inbound) rules.
         - peer: "any_ipv4"                    # Allow traffic from any IPv4 address.
           port: 5432                          # Port number (e.g., for database connections).
           description: "Allow database connections"
         - peer: "any_ipv4"
           port: 80
           description: "Allow HTTP access"
+  # Configuration for S3 trigger and EventBridge permission
+  # s3_trigger:
+  #   bucket_name: "<S3_BUCKET_ANALYSIS_NAME>"  # Name of the S3 bucket to trigger the Lambda function.
+  #   prefix: "output/"                         # Prefix filter for S3 objects to trigger the Lambda function.
+  #   suffix: ".shp"                            # Suffix filter for S3 objects to trigger the Lambda function.
+  # add_permission_eventbridge: true            # Boolean flag to add permission for EventBridge to invoke the Lambda function.
 
 ###########################
 # API Gateway Stack Settings
@@ -109,6 +116,7 @@ api_gtw_stack:
       - [ "v1/dog", "POST" ]
       - [ "v1/fish", "PUT" ]
       - [ "v1/cat", "DELETE" ]
+      - [ "v1/elephant/{proxy+}", "ANY" ]
     # Grouped API Key Configuration (only used if API key usage is enabled)
     api_key_config:
       enable_api_key: true                  # Set to true to enforce API key usage; false to disable.
@@ -117,7 +125,7 @@ api_gtw_stack:
       # Or create a new API key using the following settings:
       api_key_name: "DynamicAPIKey"         # Name of the API key (if created new).
       api_key_value: null                   # API key value (null to auto-generate, or provide a custom value between 20-40 characters).
-      usage_plan:                           # Usage plan settings associated with the API key.
+      usage_plan: # Usage plan settings associated with the API key.
         usage_plan_name: "DynamicUsagePlan"     # Name of the usage plan.
         usage_plan_description: "Usage plan for the Dynamic API"  # Description.
         plan_rate_limit: 50                 # Rate limit for the usage plan.
