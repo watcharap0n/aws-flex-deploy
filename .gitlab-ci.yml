@@ -1,0 +1,17 @@
+stages:
+  - sourcecode-scan
+
+sonarqube-check:
+  stage: sourcecode-scan
+  tags:
+    - docker-runner
+  image: sonarsource/sonar-scanner-cli:latest
+  services:
+    - name: rome.thaicom.io/docker:24.0.5-dind
+      alias: docker
+  only:
+    refs:
+      - dev
+      - master
+  script:
+    - sonar-scanner -Dsonar.projectKey=$CI_PROJECT_ROOT_NAMESPACE--$CI_PROJECT_NAME -Dsonar.sources=. -Dsonar.host.url=https://madrid.thaicom.io/sonar  -Dsonar.login=$SONAR_ID
