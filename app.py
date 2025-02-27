@@ -2,7 +2,8 @@
 import os
 import yaml
 import aws_cdk as cdk
-from cdk_stacks.lambda_stack import LambdaGisStack
+from cdk_stacks.lambda_stack import LambdaStack
+from cdk_stacks.apigw_stack import ApiGwStack
 
 # Load YAML configuration (defaults to "config.yaml", can be overridden by CONFIG_FILE env variable)
 config_file = os.environ.get('CONFIG_FILE', 'env.yaml')
@@ -13,7 +14,9 @@ with open(config_file, 'r') as stream:
 assert 'aws_region' in config
 assert 'aws_account_id' in config
 assert 'lambda_stack' in config
+assert 'api_gtw_stack' in config
 assert 'stack_name' in config['lambda_stack']
+assert 'stack_name' in config['api_gtw_stack']
 
 # Set up the CDK environment using environment variables or other means
 ENV = cdk.Environment(
@@ -24,10 +27,21 @@ ENV = cdk.Environment(
 app = cdk.App()
 
 # Create the stack, passing the configuration from the YAML file
-LambdaGisStack(
+LambdaStack(
     app,
     config['lambda_stack']['stack_name'],
     project_config=config['lambda_stack']['project_config'],
+    env=ENV,
+    tags={
+        'project': config.get('project_tag', 'EI-CarbonWatch'),
+        'environment': config.get('environment_tag', 'dev')
+    }
+)
+
+ApiGwStack(
+    app,
+    config['api_gtw_stack']['stack_name'],
+    project_config=config['api_gtw_stack']['project_config'],
     env=ENV,
     tags={
         'project': config.get('project_tag', 'EI-CarbonWatch'),

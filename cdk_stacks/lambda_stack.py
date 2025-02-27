@@ -1,4 +1,3 @@
-import os
 from aws_cdk import (
     Stack,
     aws_lambda as _lambda,
@@ -10,21 +9,20 @@ from aws_cdk import (
 )
 from constructs import Construct
 
-
-class LambdaGisStack(Stack):
+class LambdaStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, project_config: dict, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         # Load configuration from the provided dictionary
-        self.vpc_id = project_config.get('vpc_id')
-        self.bucket_layer_name = project_config.get('bucket_layer_name')
-        self.lambda_function_name = project_config.get('lambda_function_name', 'DefaultLambdaFunction')
-        self.code_from_asset = project_config.get('code_from_asset')
-        self.function_handler = project_config.get('function_handler')
-        self.memory_size = int(project_config.get('memory_size', 128))
-        ephemeral_storage_size_mb = int(project_config.get('ephemeral_storage_size', 1024))
+        self.vpc_id                 = project_config.get('vpc_id')
+        self.bucket_layer_name      = project_config.get('bucket_layer_name')
+        self.lambda_function_name   = project_config.get('lambda_function_name', 'DefaultLambdaFunction')
+        self.code_from_asset        = project_config.get('code_from_asset')
+        self.function_handler       = project_config.get('function_handler')
+        self.memory_size            = int(project_config.get('memory_size', 128))
+        ephemeral_storage_size_mb   = int(project_config.get('ephemeral_storage_size', 1024))
         self.ephemeral_storage_size = Size.mebibytes(ephemeral_storage_size_mb)
-        self.environments = project_config.get('environments', {})
+        self.environments           = project_config.get('environments', {})
 
         # =================================================================================================================
         # Dynamically configure Lambda layers
@@ -46,16 +44,10 @@ class LambdaGisStack(Stack):
         assumed_by = iam.ServicePrincipal(assumed_by_value)
         role_name = role_config.get('role_name', f'IamRole{self.lambda_function_name}')
         ids = role_config.get('ids', [
-            'PolicyBasic', 'PolicyS3', 'PolicyNetwork',
-            'PolicySecret', 'PolicySagemaker', 'PolicySES'
+            'PolicyBasic'
         ])
         managed_policy_arns = role_config.get('managed_policy_arns', [
-            'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
-            'arn:aws:iam::aws:policy/AmazonS3FullAccess',
-            'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole',
-            'arn:aws:iam::aws:policy/SecretsManagerReadWrite',
-            'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess',
-            'arn:aws:iam::aws:policy/AmazonSESFullAccess',
+            'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
         ])
         role = self.__create_role_attach_policy(
             assumed_by=assumed_by,
@@ -141,11 +133,39 @@ class LambdaGisStack(Stack):
             lambda_kwargs["allow_public_subnet"] = project_config.get('allow_public_subnet', False)
             lambda_kwargs["vpc_subnets"] = ec2.SubnetSelection(subnet_type=subnet_type)
 
-        _lambda.Function(
+        lambda_function = _lambda.Function(
             self,
             id='LambdaFunction',
             **lambda_kwargs
         )
+
+        # =================================================================================================================
+        # Optional: Configure S3 trigger if provided in the configuration
+        # =================================================================================================================
+        s3_trigger_config = project_config.get('s3_trigger')
+        if s3_trigger_config:
+            trigger_bucket_name = s3_trigger_config.get("bucket_name")
+            trigger_prefix = s3_trigger_config.get("prefix", "")
+            trigger_suffix = s3_trigger_config.get("suffix", "")
+            from aws_cdk import aws_s3_notifications as s3n
+            trigger_bucket = s3.Bucket.from_bucket_name(self, "S3TriggerBucket", trigger_bucket_name)
+            notification = s3n.LambdaDestination(lambda_function)
+            trigger_bucket.add_event_notification(
+                s3.EventType.OBJECT_CREATED,
+                notification,
+                s3.NotificationKeyFilter(prefix=trigger_prefix, suffix=trigger_suffix)
+            )
+
+        # =================================================================================================================
+        # Optional: Configure EventBridge rule if provided in the configuration
+        # =================================================================================================================
+        if project_config.get('add_permission_eventbridge', False):
+            lambda_function.add_permission(
+                "EventBridgePermission",
+                principal=iam.ServicePrincipal("events.amazonaws.com"),
+                action="lambda:InvokeFunction",
+            )
+
 
     # ==================================================================================================================
     # Helper function to load a Lambda layer from an S3 bucket dynamically.
