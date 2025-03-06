@@ -116,7 +116,10 @@ api_gtw_stack:
       - [ "v1/dog", "POST" ]
       - [ "v1/fish", "PUT" ]
       - [ "v1/cat", "DELETE" ]
-      - [ "v1/elephant/{proxy+}", "ANY" ]
+      - path: "collections/{proxy+}"
+        method: "ANY"
+        integration_type: "http_proxy"
+        http_proxy_url: "https://example.com/collections/{proxy}"
     # Grouped API Key Configuration (only used if API key usage is enabled)
     api_key_config:
       enable_api_key: true                  # Set to true to enforce API key usage; false to disable.
