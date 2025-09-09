@@ -40,6 +40,7 @@ class ApiGwStack(Stack):
             self,
             "ApiGateway",
             rest_api_name=self.rest_api_name,
+            endpoint_types=[apigw.EndpointType.REGIONAL],
             description=self.rest_api_description,
             deploy_options=apigw.StageOptions(
                 stage_name=self.stage_name,
@@ -111,7 +112,7 @@ class ApiGwStack(Stack):
                 self.create_api_resource(path, api, method, "lambda", lambda_function_arn, api_key_required_flag)
 
     def create_api_resource(self, resource_name: str, api: apigw.RestApi, method: str, integration_type: str, integration_value: str, api_key_required: bool):
-        # Create resource from fixed path parts.
+        # Create resource from fixed path parts and reuse existing child resources if present.
         parts = resource_name.split('/')
         api_resource = api.root
         for part in parts:
@@ -123,7 +124,8 @@ class ApiGwStack(Stack):
                 api_resource = existing_resource
             else:
                 api_resource = api_resource.add_resource(part)
-        stack_id = "LAMBDA_" + resource_name.upper().replace("/", "_")
+        stack_id = "LAMBDA_" + resource_name.upper() + "_" + method.upper().replace('/', '_')
+        print(f"Creating resource {resource_name} with method {method} and stack ID {stack_id}")
         self.add_methods(stack_id, api_resource, method, integration_type, integration_value, api_key_required)
 
     def create_proxy_api_resource(self, resource_name: str, api: apigw.RestApi, method: str, http_proxy_url: str,
@@ -136,8 +138,10 @@ class ApiGwStack(Stack):
         api_resource = api.root
 
         for part in parts:
-            # Build up the path
-            existing_resource = api_resource.get_resource(part)
+            try:
+                existing_resource = api_resource.get_resource(part)
+            except Exception:
+                existing_resource = None
             if existing_resource:
                 api_resource = existing_resource
             else:
@@ -145,11 +149,9 @@ class ApiGwStack(Stack):
 
         # Check if user’s YAML path already ends with {proxy+}
         if parts[-1] == "{proxy+}":
-            # The user already gave us a path with {proxy+}, so just integrate here
             stack_id = f"HTTP_PROXY_{resource_name.upper().replace('/', '_')}"
             self.add_methods(stack_id, api_resource, method, "http_proxy", http_proxy_url, api_key_required)
         else:
-            # We add {proxy+} child ourselves
             proxy_resource = api_resource.add_resource("{proxy+}")
             stack_id = f"HTTP_PROXY_{resource_name.upper().replace('/', '_')}_CHILD"
             self.add_methods(stack_id, proxy_resource, method, "http_proxy", http_proxy_url, api_key_required)
@@ -163,13 +165,15 @@ class ApiGwStack(Stack):
             integration_value: str,
             api_key_required: bool
     ):
+        method = method.upper()
+
+        # Build integration
         if integration_type == "http_proxy":
             integration = apigw.HttpIntegration(
-                integration_value,  # e.g. "https://tipgcore-dev.example.com/collections/{proxy}"
+                integration_value,
                 http_method=method,
                 proxy=True,
                 options=apigw.IntegrationOptions(
-                    # 1) Map the path param from the method request to the integration request
                     request_parameters={
                         "integration.request.path.proxy": "method.request.path.proxy"
                     },
@@ -187,22 +191,21 @@ class ApiGwStack(Stack):
                     ]
                 )
             )
+            # when using http_proxy (with {proxy+}) the method must declare the path param
+            request_params = {"method.request.path.proxy": True}
         else:
-            # Lambda integration example (unchanged)
+            # Lambda integration
             integration = apigw.LambdaIntegration(
                 handler=_lambda.Function.from_function_arn(self, id, function_arn=integration_value),
                 proxy=True
             )
+            # No special method.request.path.proxy required for standard Lambda integrations
+            request_params = None
 
-        # 2) In the primary method, declare that 'method.request.path.proxy' is required
-        resource.add_method(
-            method,
-            api_key_required=api_key_required,
+        # Add the main method. Only include request_parameters if required (e.g., proxy).
+        method_kwargs = dict(
             integration=integration,
-            request_parameters={
-                # 'True' means it's a required path parameter
-                "method.request.path.proxy": True
-            },
+            api_key_required=api_key_required,
             method_responses=[
                 apigw.MethodResponse(
                     status_code="200",
@@ -214,32 +217,38 @@ class ApiGwStack(Stack):
                 )
             ]
         )
+        if request_params:
+            method_kwargs["request_parameters"] = request_params
 
-        # OPTIONS method for CORS (unchanged)
-        resource.add_method(
-            "OPTIONS",
-            integration=apigw.MockIntegration(
-                integration_responses=[
-                    apigw.IntegrationResponse(
+        # add main method (GET/POST/...)
+        resource.add_method(method, **method_kwargs)
+
+        # Add OPTIONS method for CORS only if not already added on this resource
+        if not resource.node.try_find_child("OPTIONS"):
+            resource.add_method(
+                "OPTIONS",
+                integration=apigw.MockIntegration(
+                    integration_responses=[
+                        apigw.IntegrationResponse(
+                            status_code="200",
+                            response_parameters={
+                                "method.response.header.Access-Control-Allow-Headers":
+                                    "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'",
+                                "method.response.header.Access-Control-Allow-Origin": "'*'",
+                                "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,GET,POST,PUT,DELETE'"
+                            }
+                        )
+                    ],
+                    request_templates={"application/json": '{"statusCode": 200}'}
+                ),
+                method_responses=[
+                    apigw.MethodResponse(
                         status_code="200",
                         response_parameters={
-                            "method.response.header.Access-Control-Allow-Headers":
-                                "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'",
-                            "method.response.header.Access-Control-Allow-Origin": "'*'",
-                            "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,GET,POST,PUT,DELETE'"
+                            "method.response.header.Access-Control-Allow-Headers": True,
+                            "method.response.header.Access-Control-Allow-Origin": True,
+                            "method.response.header.Access-Control-Allow-Methods": True
                         }
                     )
-                ],
-                request_templates={"application/json": '{"statusCode": 200}'}
-            ),
-            method_responses=[
-                apigw.MethodResponse(
-                    status_code="200",
-                    response_parameters={
-                        "method.response.header.Access-Control-Allow-Headers": True,
-                        "method.response.header.Access-Control-Allow-Origin": True,
-                        "method.response.header.Access-Control-Allow-Methods": True
-                    }
-                )
-            ]
-        )
+                ]
+            )
