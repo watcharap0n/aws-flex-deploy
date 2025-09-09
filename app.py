@@ -14,9 +14,10 @@ with open(config_file, 'r') as stream:
 assert 'aws_region' in config
 assert 'aws_account_id' in config
 assert 'lambda_stack' in config
-assert 'api_gtw_stack' in config
 assert 'stack_name' in config['lambda_stack']
-assert 'stack_name' in config['api_gtw_stack']
+if config.get('api_gtw_stack'):
+    assert 'api_gtw_stack' in config
+    assert 'stack_name' in config['api_gtw_stack']
 
 # Set up the CDK environment using environment variables or other means
 ENV = cdk.Environment(
@@ -38,15 +39,16 @@ LambdaStack(
     }
 )
 
-ApiGwStack(
-    app,
-    config['api_gtw_stack']['stack_name'],
-    project_config=config['api_gtw_stack']['project_config'],
-    env=ENV,
-    tags={
-        'project': config.get('project_tag', 'EI-CarbonWatch'),
-        'environment': config.get('environment_tag', 'dev')
-    }
-)
+if config.get('api_gtw_stack'):
+    ApiGwStack(
+        app,
+        config['api_gtw_stack']['stack_name'],
+        project_config=config['api_gtw_stack']['project_config'],
+        env=ENV,
+        tags={
+            'project': config.get('project_tag', 'EI-CarbonWatch'),
+            'environment': config.get('environment_tag', 'dev')
+        }
+    )
 
 app.synth()
