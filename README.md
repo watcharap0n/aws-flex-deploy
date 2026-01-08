@@ -1,6 +1,6 @@
 # Deploying AWS CDK Stack with YAML Configuration
 
-This guide explains how to deploy an AWS CDK stack dynamically using a YAML configuration file. This setup allows for deploying various AWS services flexibly across different projects.
+This guide explains how to deploy AWS CDK stacks dynamically using a YAML configuration file. This setup allows for deploying various AWS services flexibly across different projects.
 
 ## Prerequisites
 
@@ -18,6 +18,7 @@ Ensure you have the following installed:
 /project-root
 │── cdk_stacks/             # CDK stack definitions
 │── _lambda/                # Lambda function source code (if applicable)
+│── dependencies/           # Glue job scripts or shared Python code (optional)
 │── app.py                  # CDK entry point
 │── env.yaml                # Environment configuration file
 │── requirements.txt        # Python dependencies (if applicable)
@@ -135,6 +136,62 @@ api_gtw_stack:
         plan_burst_limit: 100               # Burst limit for the usage plan.
         quota_limit: 10000                  # Quota limit for the usage plan.
         quota_period: "WEEK"                # Quota period (e.g., WEEK, DAY).
+
+###########################
+# Glue Job Stack Settings
+###########################
+glue_stack:
+  stack_name: "DynamicGlueJobStack"
+  project_config:
+    job_name: "dynamic-glue-job"
+    description: "Glue job managed by CDK and YAML configuration."
+    command:
+      name: "glueetl"
+      script_location: "s3://my-bucket/glue/scripts/job.py"
+      python_version: "3"
+    # Or use a local file and let CDK upload it to S3 on deploy:
+    # command:
+    #   name: "glueetl"
+    #   local_script_path: "dependencies/main.py"
+    #   python_version: "3"
+    glue_version: "4.0"
+    worker_type: "G.1X"
+    number_of_workers: 2
+    max_retries: 1
+    timeout: 30
+    max_concurrent_runs: 1
+    default_arguments:
+      --job-language: "python"
+      --enable-continuous-cloudwatch-log: "true"
+    additional_python_modules:
+      - "pandas==1.5.3"
+      - "pyarrow==11.0.0"
+    extra_py_files:
+      - "s3://my-bucket/glue/libs/deps.zip"
+    connections:
+      create:
+        - name: "pgstac-connection"
+          connection_type: "JDBC"
+          connection_properties:
+            JDBC_CONNECTION_URL: "jdbc:postgresql://example.rds.amazonaws.com:5432/db"
+            USERNAME: "db_user"
+            PASSWORD: "db_password"
+          physical_connection_requirements:
+            subnet_id: "subnet-0123456789abcdef0"
+            security_group_id_list:
+              - "sg-0123456789abcdef0"
+            availability_zone: "ap-southeast-1a"
+      use:
+        - "existing-connection-name"
+    role:
+      assumed_by: "glue.amazonaws.com"
+      role_name: "DynamicGlueJobRole"
+      ids:
+        - "PolicyBasic"
+        - "PolicyS3"
+      managed_policy_arns:
+        - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
 ```
 
 Update this file with your specific AWS settings before deployment.
@@ -160,7 +217,7 @@ cdk bootstrap aws://<aws_account_id>/<aws_region>
 To deploy the stack, run:
 
 ```sh
-cdk deploy --context env=env.yaml
+CONFIG_FILE=env.yaml cdk deploy
 ```
 
 This command reads the configuration from `env.yaml` and deploys the stack dynamically.
@@ -184,4 +241,3 @@ This project is designed to be modular, allowing dynamic deployment of various A
 - If a stack fails, check CloudFormation logs for details.
 
 For more details, refer to the [AWS CDK documentation](https://docs.aws.amazon.com/cdk/latest/guide/home.html).
-
