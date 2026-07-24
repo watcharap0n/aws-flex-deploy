@@ -4,6 +4,7 @@ from aws_cdk import (
     aws_iam as iam,
     aws_s3_assets as s3_assets,
 )
+import re
 from constructs import Construct
 
 
@@ -113,7 +114,7 @@ class GlueJobStack(Stack):
         assumed_by_value = role_config.get("assumed_by", "glue.amazonaws.com")
         assumed_by = iam.ServicePrincipal(assumed_by_value)
         role_name = role_config.get("role_name", f"GlueJobRole{job_name}")
-        ids = role_config.get("ids", ["PolicyBasic"])
+        ids = role_config.get("ids")
         managed_policy_arns = role_config.get(
             "managed_policy_arns",
             ["arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"]
@@ -125,9 +126,16 @@ class GlueJobStack(Stack):
             role_name=role_name
         )
 
-        if len(ids) != len(managed_policy_arns):
+        resolved_ids = ids
+        if not resolved_ids:
+            resolved_ids = [
+                self._generate_policy_id(managed_policy_arn=managed_policy_arn, index=index)
+                for index, managed_policy_arn in enumerate(managed_policy_arns, start=1)
+            ]
+
+        if len(resolved_ids) != len(managed_policy_arns):
             raise ValueError("ids and managed_policy_arns must have the same length")
-        for id_val, managed_policy_arn in zip(ids, managed_policy_arns):
+        for id_val, managed_policy_arn in zip(resolved_ids, managed_policy_arns):
             role.add_managed_policy(
                 iam.ManagedPolicy.from_managed_policy_arn(
                     self,
@@ -152,3 +160,10 @@ class GlueJobStack(Stack):
                 role.attach_inline_policy(policy)
 
         return role
+
+    def _generate_policy_id(self, managed_policy_arn: str, index: int) -> str:
+        policy_name = managed_policy_arn.split('/')[-1] if managed_policy_arn else 'ManagedPolicy'
+        cleaned = re.sub(r'[^A-Za-z0-9]+', ' ', policy_name).strip()
+        normalized = ''.join(part.capitalize() for part in cleaned.split()) or 'ManagedPolicy'
+        return f"{normalized}Policy{index}"
+

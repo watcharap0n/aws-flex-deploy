@@ -14,13 +14,18 @@ with open(config_file, 'r') as stream:
 # Validate the configuration
 assert 'aws_region' in config
 assert 'aws_account_id' in config
-assert 'lambda_stack' in config
-assert 'stack_name' in config['lambda_stack']
+
+# Support both a single lambda_stack (dict) and multiple lambda_stacks (list of dicts)
+_raw_lambda = config.get('lambda_stacks') or config.get('lambda_stack')
+if _raw_lambda is None:
+    raise AssertionError("env.yaml must define 'lambda_stack' or 'lambda_stacks'")
+lambda_stack_configs = _raw_lambda if isinstance(_raw_lambda, list) else [_raw_lambda]
+for _ls in lambda_stack_configs:
+    assert 'stack_name' in _ls, f"Each lambda stack entry must have a 'stack_name': {_ls}"
+
 if config.get('api_gtw_stack'):
-    assert 'api_gtw_stack' in config
     assert 'stack_name' in config['api_gtw_stack']
 if config.get('glue_stack'):
-    assert 'glue_stack' in config
     assert 'stack_name' in config['glue_stack']
 
 # Set up the CDK environment using environment variables or other means
@@ -31,17 +36,20 @@ ENV = cdk.Environment(
 
 app = cdk.App()
 
-# Create the stack, passing the configuration from the YAML file
-LambdaStack(
-    app,
-    config['lambda_stack']['stack_name'],
-    project_config=config['lambda_stack']['project_config'],
-    env=ENV,
-    tags={
-        'project': config.get('project_tag', 'EI-CarbonWatch'),
-        'environment': config.get('environment_tag', 'dev')
-    }
-)
+tags = {
+    'project': config.get('project_tag', 'EI-CarbonWatch'),
+    'environment': config.get('environment_tag', 'dev')
+}
+
+# Deploy one Lambda stack per entry (supports both single dict and list of dicts)
+for lambda_stack_conf in lambda_stack_configs:
+    LambdaStack(
+        app,
+        lambda_stack_conf['stack_name'],
+        project_config=lambda_stack_conf['project_config'],
+        env=ENV,
+        tags=tags,
+    )
 
 if config.get('api_gtw_stack'):
     ApiGwStack(
@@ -49,10 +57,7 @@ if config.get('api_gtw_stack'):
         config['api_gtw_stack']['stack_name'],
         project_config=config['api_gtw_stack']['project_config'],
         env=ENV,
-        tags={
-            'project': config.get('project_tag', 'EI-CarbonWatch'),
-            'environment': config.get('environment_tag', 'dev')
-        }
+        tags=tags,
     )
 
 if config.get('glue_stack'):
@@ -61,10 +66,7 @@ if config.get('glue_stack'):
         config['glue_stack']['stack_name'],
         project_config=config['glue_stack']['project_config'],
         env=ENV,
-        tags={
-            'project': config.get('project_tag', 'EI-CarbonWatch'),
-            'environment': config.get('environment_tag', 'dev')
-        }
+        tags=tags,
     )
 
 app.synth()

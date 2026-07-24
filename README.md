@@ -47,31 +47,22 @@ lambda_stack:
     lambda_function_name: "test-dynamic-lambda"   # Name of the Lambda function.
     code_from_asset: "_lambda"              # Directory containing the Lambda function code.
     function_handler: "lambda_function.lambda_handler"  # Lambda handler (file.function).
+    python_version: "3.10"                  # Optional. Supported: 3.8, 3.9, 3.10, 3.11 (default: 3.9)
+    timeout: 30                             # Optional. Lambda timeout in seconds (default: 30, max: 900)
     memory_size: 256                        # Memory (MB) allocated to the Lambda function.
     ephemeral_storage_size: 1024            # Ephemeral storage size (MB) for the Lambda.
     environments:
       ENV_VAR: "value"                      # Environment variables for the Lambda function.
       S3_BUCKET: "my-bucket"                # Example environment variable.
-    layers: # List of Lambda layers (from S3).
-      - id: "Geoalchemy2Layer"
-        key: "geoalchemy2.zip"
-      - id: "GeopandasLayer"
-        key: "geopandas.zip"
-      - id: "Psycopg2Layer"
-        key: "psycopg2-binary.zip"
-      - id: "PydanticV2Layer"
-        key: "pydantic-v2.zip"
+    layers: # List of Lambda layers (from S3). IDs are auto-generated from keys.
+      - key: "geoalchemy2.zip"
+      - key: "geopandas.zip"
+      - key: "psycopg2-binary.zip"
+      - key: "pydantic-v2.zip"
     role: # IAM Role configuration for the Lambda.
       assumed_by: "lambda.amazonaws.com"    # Principal that can assume this role.
       role_name: "IamRoleLambdaDynamic"     # Name of the IAM role.
-      ids: # Identifiers for the managed policies.
-        - "PolicyBasic"
-        - "PolicyS3"
-        - "PolicyNetwork"
-        - "PolicySecret"
-        - "PolicySagemaker"
-        - "PolicySES"
-      managed_policy_arns: # ARNs for the managed policies to attach.
+      managed_policy_arns: # ARNs for the managed policies to attach. IDs are auto-generated.
         - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
         - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
         - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
@@ -89,6 +80,10 @@ lambda_stack:
         - peer: "any_ipv4"
           port: 80
           description: "Allow HTTP access"
+      # Or import existing security groups instead of creating a new one:
+      # existing_ids:
+      #   - "sg-0123456789abcdef0"
+      #   - "sg-0fedcba9876543210"
   # Configuration for S3 trigger and EventBridge permission
   # s3_trigger:
   #   bucket_name: "<S3_BUCKET_ANALYSIS_NAME>"  # Name of the S3 bucket to trigger the Lambda function.
@@ -186,15 +181,29 @@ glue_stack:
     role:
       assumed_by: "glue.amazonaws.com"
       role_name: "DynamicGlueJobRole"
-      ids:
-        - "PolicyBasic"
-        - "PolicyS3"
       managed_policy_arns:
         - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
         - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
 ```
 
 Update this file with your specific AWS settings before deployment.
+
+### Using an Existing Lambda Security Group
+
+If your Lambda should reuse an existing security group, set `lambda_stack.project_config.vpc_id` and configure:
+
+```yaml
+security_group:
+  existing_ids:
+    - "sg-0123456789abcdef0"
+```
+
+Notes:
+
+- `existing_ids` accepts one or more security group IDs.
+- When `existing_ids` is used, do not combine it with `name`, `description`, `allow_all_outbound`, or `ingress_rules`.
+- If `existing_ids` is omitted, the stack keeps the current behavior and creates a new security group.
+- Set `python_version` in each Lambda `project_config` to choose runtime (supported: `3.8`, `3.9`, `3.10`, `3.11`).
 
 ## Installing Dependencies
 
