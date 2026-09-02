@@ -4,6 +4,8 @@ from aws_cdk import (
     aws_iam as iam,
     aws_ec2 as ec2,
     aws_s3 as s3,
+    aws_events as events,
+    aws_events_targets as event_targets,
     Duration,
     Size,
 )
@@ -22,6 +24,12 @@ class LambdaStack(Stack):
         self.function_handler       = project_config.get('function_handler')
         self.memory_size            = int(project_config.get('memory_size', 128))
         self.timeout_seconds        = int(project_config.get('timeout', 30))
+        reserved_concurrency        = project_config.get('reserved_concurrent_executions')
+        self.reserved_concurrency   = (
+            int(reserved_concurrency)
+            if reserved_concurrency is not None
+            else None
+        )
         ephemeral_storage_size_mb   = int(project_config.get('ephemeral_storage_size', 1024))
         self.ephemeral_storage_size = Size.mebibytes(ephemeral_storage_size_mb)
         self.environments           = project_config.get('environments', {})
@@ -178,6 +186,10 @@ class LambdaStack(Stack):
             lambda_kwargs["allow_public_subnet"] = project_config.get('allow_public_subnet', False)
             if vpc_subnets is not None:
                 lambda_kwargs["vpc_subnets"] = vpc_subnets
+        if self.reserved_concurrency is not None:
+            lambda_kwargs["reserved_concurrent_executions"] = (
+                self.reserved_concurrency
+            )
 
         lambda_function = _lambda.Function(
             self,
@@ -201,6 +213,31 @@ class LambdaStack(Stack):
                 notification,
                 s3.NotificationKeyFilter(prefix=trigger_prefix, suffix=trigger_suffix)
             )
+
+        # Optional: reconcile terminal ECS task events back into the Lambda
+        # that originally dispatched the task.
+        ecs_task_state_rule = project_config.get('ecs_task_state_rule')
+        if ecs_task_state_rule:
+            cluster_arn = ecs_task_state_rule.get('cluster_arn')
+            task_family = ecs_task_state_rule.get('task_family')
+            if not cluster_arn or not task_family:
+                raise ValueError(
+                    'ecs_task_state_rule requires cluster_arn and task_family'
+                )
+            rule = events.Rule(
+                self,
+                'EcsTaskStoppedRule',
+                event_pattern=events.EventPattern(
+                    source=['aws.ecs'],
+                    detail_type=['ECS Task State Change'],
+                    detail={
+                        'clusterArn': [cluster_arn],
+                        'group': [f'family:{task_family}'],
+                        'lastStatus': ['STOPPED'],
+                    },
+                ),
+            )
+            rule.add_target(event_targets.LambdaFunction(lambda_function))
 
         # =================================================================================================================
         # Optional: Configure EventBridge rule if provided in the configuration
@@ -309,4 +346,3 @@ class LambdaStack(Stack):
         cleaned = re.sub(r'[^A-Za-z0-9]+', ' ', policy_name).strip()
         normalized = ''.join(part.capitalize() for part in cleaned.split()) or 'ManagedPolicy'
         return f'{normalized}Policy{index}'
-

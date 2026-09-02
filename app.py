@@ -5,6 +5,7 @@ import aws_cdk as cdk
 from cdk_stacks.lambda_stack import LambdaStack
 from cdk_stacks.apigw_stack import ApiGwStack
 from cdk_stacks.glue_stack import GlueJobStack
+from cdk_stacks.connector_runtime_stack import ConnectorRuntimeStack
 
 # Load YAML configuration (defaults to "config.yaml", can be overridden by CONFIG_FILE env variable)
 config_file = os.environ.get('CONFIG_FILE', 'env.yaml')
@@ -17,9 +18,17 @@ assert 'aws_account_id' in config
 
 # Support both a single lambda_stack (dict) and multiple lambda_stacks (list of dicts)
 _raw_lambda = config.get('lambda_stacks') or config.get('lambda_stack')
-if _raw_lambda is None:
-    raise AssertionError("env.yaml must define 'lambda_stack' or 'lambda_stacks'")
-lambda_stack_configs = _raw_lambda if isinstance(_raw_lambda, list) else [_raw_lambda]
+if (
+    _raw_lambda is None
+    and not config.get('connector_runtime_stack')
+    and not config.get('standardization_runtime_stack')
+):
+    raise AssertionError(
+        "env.yaml must define lambda_stack(s) or connector_runtime_stack"
+    )
+lambda_stack_configs = (
+    _raw_lambda if isinstance(_raw_lambda, list) else [_raw_lambda]
+) if _raw_lambda is not None else []
 for _ls in lambda_stack_configs:
     assert 'stack_name' in _ls, f"Each lambda stack entry must have a 'stack_name': {_ls}"
 
@@ -47,6 +56,33 @@ for lambda_stack_conf in lambda_stack_configs:
         app,
         lambda_stack_conf['stack_name'],
         project_config=lambda_stack_conf['project_config'],
+        env=ENV,
+        tags=tags,
+    )
+
+if config.get('connector_runtime_stack'):
+    connector_stack_config = config['connector_runtime_stack']
+    if not connector_stack_config.get('stack_name'):
+        raise AssertionError("connector_runtime_stack requires stack_name")
+    ConnectorRuntimeStack(
+        app,
+        connector_stack_config['stack_name'],
+        project_config=connector_stack_config['project_config'],
+        env=ENV,
+        tags=tags,
+    )
+
+if config.get('standardization_runtime_stack'):
+    # Keep connector-only synths independent from the optional standardization stack.
+    from cdk_stacks.standardization_runtime_stack import StandardizationRuntimeStack
+
+    standardization_stack_config = config['standardization_runtime_stack']
+    if not standardization_stack_config.get('stack_name'):
+        raise AssertionError("standardization_runtime_stack requires stack_name")
+    StandardizationRuntimeStack(
+        app,
+        standardization_stack_config['stack_name'],
+        project_config=standardization_stack_config['project_config'],
         env=ENV,
         tags=tags,
     )

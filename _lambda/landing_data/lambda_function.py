@@ -1,15 +1,14 @@
-"""S3 landing Lambda: XLSX/CSV/JSON evidence and idempotent CSV publication.
+"""S3 landing Lambda: single-source customer evidence and CSV publication.
 
 Input contract:
-    data_sources/<source_code>/<batch_ref>/customer_ids/<file>.(xlsx|csv|json)
-    data_sources/<source_code>/<batch_ref>/customer_profiles/<file>.(xlsx|csv|json)
+    data_sources/<source_code>/<batch_ref>/customers/<file>.(xlsx|csv|json)
 
-Output contract (created only after both source files are valid):
+Output contract (created after the one customer file is valid):
     raw/<source_code>/<landing_batch_id>/customer.csv
 
-This Lambda owns only control.source_landing_*, raw.customer_ids_source,
-raw.customer_profiles_source, and the output object.  The downstream CSV
-Lambda owns control.source_system, control.ingestion_batch, and raw.customer.
+This Lambda owns only control.source_landing_*, raw.customer_landing_source,
+and the output object. The downstream CSV Lambda owns control.source_system,
+control.ingestion_batch, and raw.customer.
 
 Python runtime: 3.10
 Layer/package dependencies: pandas, openpyxl, psycopg2-binary
@@ -60,21 +59,54 @@ SOURCE_CODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 BATCH_REF_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 
 SOURCE_CONFIG = {
-    "customer_ids": {
-        "required_key": "CustCd",
-        "table": "raw.customer_ids_source",
-        "key_column": "cust_cd",
-    },
-    "customer_profiles": {
-        "required_key": "StoreCode",
-        "table": "raw.customer_profiles_source",
-        "key_column": "store_code",
+    "customers": {
+        "required_key": "source_customer_id",
+        "table": "raw.customer_landing_source",
+        "key_column": "source_customer_id",
     },
 }
 
-# Read identifiers as text wherever these columns exist.  This is deliberately
-# broader than the two join keys so phone/device/source identifiers do not pass
-# through a floating-point representation before being stored as evidence.
+# Canonical names are preferred. The aliases make the cut-over tolerant of the
+# existing CRM profile export and the previous canonical CSV without bringing
+# back the old two-file join.
+COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "source_customer_id": ("source_customer_id", "customer_id", "StoreCode"),
+    "external_id": ("external_id",),
+    "first_name": ("first_name", "FirstName"),
+    "middle_name": ("middle_name", "MiddleName"),
+    "last_name": ("last_name", "LastName"),
+    "full_name": ("full_name",),
+    "nickname": ("nickname",),
+    "email": ("email", "Email"),
+    "phone": ("phone", "phone_number", "ContactNumber"),
+    "gender": ("gender", "Gender"),
+    "date_of_birth": ("date_of_birth", "dob"),
+    "birthday": ("birthday",),
+    "age": ("age",),
+    "line_user_id": ("line_user_id", "LineUuid"),
+    "facebook_id": ("facebook_id",),
+    "google_id": ("google_id",),
+    "apple_id": ("apple_id",),
+    "member_code": ("member_code",),
+    "customer_type": ("customer_type",),
+    "status": ("status",),
+    "language": ("language",),
+    "address_line_1": ("address_line_1", "address", "StoreAddress"),
+    "address_line_2": ("address_line_2",),
+    "district": ("district", "city", "StoreDistrict"),
+    "province": ("province", "state", "StoreProvince"),
+    "postal_code": ("postal_code", "StorePostCode"),
+    "country": ("country",),
+    "source": ("source",),
+    "source_system": ("source_system",),
+    "external_ids": ("external_ids",),
+    "attributes": ("attributes",),
+    "source_created_at": ("source_created_at", "signup_date", "RegisterDate"),
+    "source_updated_at": ("source_updated_at",),
+}
+
+# Read identifiers as text wherever these columns exist so phone, customer,
+# device, and source identifiers never pass through a floating-point value.
 IDENTIFIER_COLUMNS = {
     "CustCd",
     "StoreCode",
@@ -94,20 +126,39 @@ SUCCESS_FILE_STATUSES = {"INGESTED", "INGESTED_WITH_WARNINGS"}
 TERMINAL_FILE_STATUSES = SUCCESS_FILE_STATUSES | {"INVALID"}
 
 CSV_COLUMNS = [
-    "customer_id",
+    "source_customer_id",
+    "external_id",
     "first_name",
+    "middle_name",
     "last_name",
+    "full_name",
+    "nickname",
     "email",
-    "phone_number",
+    "phone",
     "gender",
-    "dob",
-    "signup_date",
-    "address",
-    "city",
-    "state",
+    "date_of_birth",
+    "birthday",
+    "age",
+    "line_user_id",
+    "facebook_id",
+    "google_id",
+    "apple_id",
+    "member_code",
+    "customer_type",
+    "status",
+    "language",
+    "address_line_1",
+    "address_line_2",
+    "district",
+    "province",
+    "postal_code",
     "country",
-    "device_id(s)",
     "source",
+    "source_system",
+    "external_ids",
+    "attributes",
+    "source_created_at",
+    "source_updated_at",
 ]
 
 
@@ -234,7 +285,7 @@ def _source_from_record(
         raise ValueError(
             "S3 key must be "
             f"{config.input_prefix}<source_code>/<batch_ref>/"
-            "<customer_ids|customer_profiles>/<file>.(xlsx|csv|json)"
+            "customers/<file>.(xlsx|csv|json)"
         )
 
     source_code, batch_ref, source_type, filename = parts
@@ -249,9 +300,7 @@ def _source_from_record(
             "underscore, or hyphen (maximum 128 characters)"
         )
     if source_type not in SOURCE_CONFIG:
-        raise ValueError(
-            "source_type must be customer_ids or customer_profiles"
-        )
+        raise ValueError("source_type must be customers")
     if filename.rsplit(".", 1)[-1].casefold() not in SUPPORTED_FILE_FORMATS:
         return None
 
@@ -352,8 +401,15 @@ def _unique_headers(columns: Iterable[Any]) -> list[str]:
 
 
 def _matching_columns(columns: Iterable[Any], expected: str) -> list[str]:
-    wanted = _normalise_name(expected)
-    return [str(column) for column in columns if _normalise_name(column) == wanted]
+    wanted = {
+        _normalise_name(alias)
+        for alias in COLUMN_ALIASES.get(expected, (expected,))
+    }
+    return [
+        str(column)
+        for column in columns
+        if _normalise_name(column) in wanted
+    ]
 
 
 def _is_identifier_header(value: Any) -> bool:
@@ -386,7 +442,7 @@ def _frame_to_evidence(
     if not required_matches:
         file_errors.append(f"missing_required_column:{required_key}")
     elif len(required_matches) > 1:
-        file_errors.append(f"duplicate_required_column:{required_key}")
+        file_errors.append(f"ambiguous_required_column:{required_key}")
     if frame.empty:
         file_errors.append("no_data_rows")
 
@@ -916,9 +972,12 @@ def _payload_dict(value: Any) -> dict[str, Any]:
 
 
 def _payload_value(payload: Mapping[str, Any], name: str) -> Any:
-    wanted = _normalise_name(name)
+    wanted = {
+        _normalise_name(alias)
+        for alias in COLUMN_ALIASES.get(name, (name,))
+    }
     for key, value in payload.items():
-        if _normalise_name(key) == wanted:
+        if _normalise_name(key) in wanted:
             return value
     return None
 
@@ -929,7 +988,7 @@ def _text_value(value: Any) -> str:
     return str(value).strip()
 
 
-def _normalise_signup_date(value: Any) -> str:
+def _normalise_date(value: Any) -> str:
     if _is_missing(value):
         return ""
     if isinstance(value, datetime):
@@ -961,13 +1020,150 @@ def _normalise_signup_date(value: Any) -> str:
     return parsed.date().isoformat()
 
 
-def _device_ids(payload: Mapping[str, Any]) -> str:
-    values: list[str] = []
-    for name in ("_id", "BzbsUserId", "LineUuid"):
-        value = _identifier_text(_payload_value(payload, name))
-        if value and value not in values:
-            values.append(value)
-    return ";".join(values)
+def _normalise_timestamp(value: Any) -> str:
+    if _is_missing(value):
+        return ""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    text = str(value).strip()
+    if not text:
+        return ""
+    parsed = pd.to_datetime(text, errors="coerce", utc=True)
+    if pd.isna(parsed):
+        return ""
+    return parsed.isoformat()
+
+
+def _json_object(value: Any, field_name: str) -> dict[str, Any]:
+    if _is_missing(value):
+        return {}
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field_name} must be a JSON object") from exc
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError(f"{field_name} must be a JSON object")
+
+
+def _external_ids(payload: Mapping[str, Any]) -> dict[str, Any]:
+    result = _json_object(_payload_value(payload, "external_ids"), "external_ids")
+
+    legacy_devices = _payload_value(payload, "device_id(s)")
+    if not _is_missing(legacy_devices):
+        values = [
+            item.strip()
+            for item in re.split(r"[;,|]", str(legacy_devices))
+            if item.strip()
+        ]
+        if values:
+            result["device_ids"] = list(dict.fromkeys(values))
+
+    typed_identifiers = {
+        "crm_record_id": "_id",
+        "bzbs_user_id": "BzbsUserId",
+        "line_user_id": "line_user_id",
+        "national_id": "IDCard",
+        "external_id": "external_id",
+        "facebook_id": "facebook_id",
+        "google_id": "google_id",
+        "apple_id": "apple_id",
+        "member_code": "member_code",
+    }
+    for target, source in typed_identifiers.items():
+        value = _identifier_text(_payload_value(payload, source))
+        if value and target not in result:
+            result[target] = value
+    return result
+
+
+def _canonical_customer_row(
+        source_customer_id: Any,
+        payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    first_name = _text_value(_payload_value(payload, "first_name"))
+    middle_name = _text_value(_payload_value(payload, "middle_name"))
+    last_name = _text_value(_payload_value(payload, "last_name"))
+    full_name = _text_value(_payload_value(payload, "full_name"))
+    if not full_name:
+        full_name = " ".join(
+            part for part in (first_name, middle_name, last_name) if part
+        )
+
+    return {
+        "source_customer_id": _identifier_text(source_customer_id) or "",
+        "external_id": _identifier_text(
+            _payload_value(payload, "external_id")
+        ) or "",
+        "first_name": first_name,
+        "middle_name": middle_name,
+        "last_name": last_name,
+        "full_name": full_name,
+        "nickname": _text_value(_payload_value(payload, "nickname")),
+        "email": _text_value(_payload_value(payload, "email")),
+        "phone": _identifier_text(_payload_value(payload, "phone")) or "",
+        "gender": _text_value(_payload_value(payload, "gender")),
+        "date_of_birth": _normalise_date(
+            _payload_value(payload, "date_of_birth")
+            if not _is_missing(_payload_value(payload, "date_of_birth"))
+            else _payload_value(payload, "birthday")
+        ),
+        "birthday": _normalise_date(_payload_value(payload, "birthday")),
+        "age": _identifier_text(_payload_value(payload, "age")) or "",
+        "line_user_id": _identifier_text(
+            _payload_value(payload, "line_user_id")
+        ) or "",
+        "facebook_id": _identifier_text(
+            _payload_value(payload, "facebook_id")
+        ) or "",
+        "google_id": _identifier_text(
+            _payload_value(payload, "google_id")
+        ) or "",
+        "apple_id": _identifier_text(
+            _payload_value(payload, "apple_id")
+        ) or "",
+        "member_code": _identifier_text(
+            _payload_value(payload, "member_code")
+        ) or "",
+        "customer_type": _text_value(
+            _payload_value(payload, "customer_type")
+        ),
+        "status": _text_value(_payload_value(payload, "status")),
+        "language": _text_value(_payload_value(payload, "language")),
+        "address_line_1": _text_value(
+            _payload_value(payload, "address_line_1")
+        ),
+        "address_line_2": _text_value(
+            _payload_value(payload, "address_line_2")
+        ),
+        "district": _text_value(_payload_value(payload, "district")),
+        "province": _text_value(_payload_value(payload, "province")),
+        "postal_code": _identifier_text(
+            _payload_value(payload, "postal_code")
+        ) or "",
+        "country": _text_value(_payload_value(payload, "country")),
+        "source": _text_value(_payload_value(payload, "source")),
+        "source_system": _text_value(
+            _payload_value(payload, "source_system")
+        ),
+        "external_ids": json.dumps(
+            _external_ids(payload), ensure_ascii=False, sort_keys=True
+        ),
+        "attributes": json.dumps(
+            _json_object(_payload_value(payload, "attributes"), "attributes"),
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        "source_created_at": _normalise_timestamp(
+            _payload_value(payload, "source_created_at")
+        ),
+        "source_updated_at": _normalise_timestamp(
+            _payload_value(payload, "source_updated_at")
+        ),
+    }
 
 
 def _build_customer_csv(
@@ -979,34 +1175,20 @@ def _build_customer_csv(
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                WITH latest_ids AS (SELECT DISTINCT ON (cust_cd) cust_cd,
-                                                                 raw_payload
-                                    FROM raw.customer_ids_source
-                                    WHERE batch_id = %s
-                                      AND cust_cd IS NOT NULL
-                                      AND btrim(cust_cd) <> ''
-                                    ORDER BY cust_cd,
-                                             source_row_number DESC,
-                                             source_record_id DESC),
-                     latest_profiles AS (SELECT DISTINCT ON (store_code) store_code,
-                                                                         raw_payload
-                                         FROM raw.customer_profiles_source
-                                         WHERE batch_id = %s
-                                           AND store_code IS NOT NULL
-                                           AND btrim(store_code) <> ''
-                                         ORDER BY store_code,
-                                                  source_row_number DESC,
-                                                  source_record_id DESC)
-                SELECT profiles.store_code,
-                       profiles.raw_payload
-                FROM latest_ids AS ids
-                         INNER JOIN latest_profiles AS profiles
-                                    ON profiles.store_code = ids.cust_cd
-                ORDER BY profiles.store_code
+                SELECT DISTINCT ON (source_customer_id)
+                       source_customer_id,
+                       raw_payload
+                FROM raw.customer_landing_source
+                WHERE batch_id = %s
+                  AND source_customer_id IS NOT NULL
+                  AND btrim(source_customer_id) <> ''
+                ORDER BY source_customer_id,
+                         source_row_number DESC,
+                         source_record_id DESC
                 """,
-                (batch_id, batch_id),
+                (batch_id,),
             )
-            matched = cursor.fetchall()
+            customers = cursor.fetchall()
 
     output = io.StringIO(newline="")
     writer = csv.DictWriter(
@@ -1016,34 +1198,12 @@ def _build_customer_csv(
         lineterminator="\n",
     )
     writer.writeheader()
-    for store_code, raw_payload in matched:
+    for source_customer_id, raw_payload in customers:
         payload = _payload_dict(raw_payload)
-        writer.writerow(
-            {
-                "customer_id": _identifier_text(store_code) or "",
-                "first_name": _text_value(_payload_value(payload, "FirstName")),
-                "last_name": _text_value(_payload_value(payload, "LastName")),
-                "email": "",
-                "phone_number": _identifier_text(
-                    _payload_value(payload, "ContactNumber")
-                )
-                                or "",
-                "gender": "",
-                "dob": "",
-                "signup_date": _normalise_signup_date(
-                    _payload_value(payload, "RegisterDate")
-                ),
-                "address": _text_value(_payload_value(payload, "StoreAddress")),
-                "city": _text_value(_payload_value(payload, "StoreDistrict")),
-                "state": _text_value(_payload_value(payload, "StoreProvince")),
-                "country": "",
-                "device_id(s)": _device_ids(payload),
-                "source": source_code,
-            }
-        )
+        writer.writerow(_canonical_customer_row(source_customer_id, payload))
 
     # utf-8-sig inserts a BOM, which the downstream Lambda explicitly accepts.
-    return output.getvalue().encode("utf-8-sig"), len(matched)
+    return output.getvalue().encode("utf-8-sig"), len(customers)
 
 
 def _mark_output_failed(connection: Any, batch_id: str, error: str) -> None:
@@ -1237,7 +1397,7 @@ def _reconcile_output(
                 )
                 if not ready:
                     return {
-                        "status": "waiting_for_counterpart",
+                        "status": "waiting_for_customer_file",
                         "batch_id": batch_id,
                         "source_code": source_code,
                         "batch_ref": batch_ref,
@@ -1252,10 +1412,7 @@ def _reconcile_output(
                 elif len(source_buckets) == 1:
                     output_bucket = next(iter(source_buckets))
                 else:
-                    raise ValueError(
-                        "OUTPUT_BUCKET is required when the two source files "
-                        "are in different S3 buckets"
-                    )
+                    raise ValueError("Unable to resolve the output S3 bucket")
 
                 output_key = (
                     f"{config.output_root_prefix}{source_code}/"
@@ -1284,13 +1441,13 @@ def _reconcile_output(
             connection, batch_id, source_code
         )
         if row_count == 0:
-            error = "matched_rows_zero"
+            error = "valid_customer_rows_zero"
             _mark_output_failed(connection, batch_id, error)
             LOGGER.warning(
                 "csv_not_published batch_id=%s reason=%s", batch_id, error
             )
             return {
-                "status": "not_published_no_matches",
+                "status": "not_published_no_valid_customers",
                 "batch_id": batch_id,
                 "source_code": source_code,
                 "batch_ref": batch_ref,

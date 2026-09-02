@@ -223,6 +223,122 @@ cdk bootstrap aws://<aws_account_id>/<aws_region>
 
 ## Deploying the CDK Stack
 
+### Customer ingestion contract
+
+The customer landing flow accepts exactly one source file per source and batch:
+
+```text
+data_sources/<source_code>/<batch_ref>/customers/<file>.(csv|xlsx|json)
+```
+
+The only required source column is `source_customer_id`. Optional source
+columns are `external_id`, `first_name`, `middle_name`, `last_name`,
+`full_name`, `nickname`, `email`, `phone`, `gender`, `date_of_birth`,
+`birthday`, `age`, `line_user_id`, `facebook_id`, `google_id`, `apple_id`,
+`member_code`, `customer_type`, `status`, `language`, `address_line_1`,
+`address_line_2`, `district`, `province`, `postal_code`, `country`, `source`,
+`source_system`, `external_ids`, `attributes`, `source_created_at`, and
+`source_updated_at`.
+
+`raw_customer_id`, `batch_id`, `source_system_id`, `raw_payload`, `created_at`,
+`updated_at`, and `ingested_at` are pipeline-managed and must not be supplied by
+the source file. `customer_id` is a nullable legacy database column; it is not
+the source identifier and is intentionally not part of the upload contract.
+
+The CRM aliases `StoreCode`, `FirstName`, `LastName`, `ContactNumber`, and
+`RegisterDate` remain accepted during the cut-over. The landing Lambda writes:
+
+```text
+raw/<source_code>/<landing_batch_id>/customer.csv
+```
+
+Apply the database migration before deploying the Lambda stacks:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/migrations/013_single_customer_source.sql
+```
+
+Apply pipeline lineage and stitching tracking before deploying the updated
+ingestion Lambda or Fargate image:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/migrations/014_pipeline_tracking.sql
+
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/queries/verify_pipeline_tracking.sql
+```
+
+Then apply the customer data-quality snapshot migration. Migration 015 must be
+present before either the updated ingestion Lambda or Fargate image is
+deployed:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/migrations/015_customer_data_quality.sql
+
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/queries/verify_customer_data_quality.sql
+```
+
+Allow different source records to carry the same external identity signal.
+`raw.customer` remains unique by `(source_system_id, source_customer_id)`;
+identity merging belongs to the downstream stitcher:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/migrations/016_shared_customer_external_ids.sql
+```
+
+The quality layer is DB-first and runs between standardization and stitching.
+Data findings are informational and do not stop stitching; a technical
+validation or snapshot-write failure marks the pipeline `FAILED` with
+`error_stage = 'VALIDATION'` and prevents the resolver from starting.
+
+`control.customer_pipeline_status` is the read-only contract for a future API.
+Query it with the public landing batch ID:
+
+```sql
+SELECT *
+FROM control.customer_pipeline_status
+WHERE landing_batch_id = $1;
+```
+
+The two PII-safe detail contracts use the same public ID:
+
+```sql
+SELECT *
+FROM control.customer_data_quality_metric
+WHERE landing_batch_id = $1;
+
+SELECT *
+FROM control.customer_data_quality_record
+WHERE landing_batch_id = $1;
+```
+
+Migration 015 intentionally does not backfill old batches. For historical
+batches `control.customer_pipeline_status.validation_available` remains
+`false`, because current-state raw/staging rows cannot recreate a trustworthy
+arrival-time snapshot.
+
+After a test upload, run the read-only verification queries:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/queries/verify_customer_pipeline.sql
+```
+
+Deploy the landing stack before the ingestion stack so no new canonical output
+is consumed by the old ingestion contract.
+
+For a tracking-only release, deploy the Fargate image/task revision first and
+then deploy only the ingestion stack:
+
+```sh
+CONFIG_FILE=env.yaml cdk deploy CdpIngestionData
+```
+
 To deploy the stack, run:
 
 ```sh
@@ -238,6 +354,42 @@ If you need to remove the stack, run:
 ```sh
 cdk destroy
 ```
+
+## Database connector runtime stack
+
+`ConnectorRuntimeStack` is the AWS orchestration half of database connector
+intake. It creates encrypted occurrence/dispatch/result queues and DLQs,
+EventBridge Scheduler group/role, an idempotent dispatch Lambda, a Standard Step
+Functions workflow, logs, alarms, and least-privilege IAM policies.
+
+The stack deliberately imports the ECS cluster, connector task definition,
+identity stitcher task definition, container names, and task/pass roles. It does
+not create an ECS service, task definition, cluster, ECR repository, or image.
+Copy [env.connector.example.yaml](env.connector.example.yaml) and replace every
+placeholder with an existing reference before synth or deployment.
+
+The workflow routes operations as follows:
+
+- `CONNECTION_TEST`, `SCHEMA_DISCOVERY`, and `DATASET_PREVIEW`: imported
+  connector task only.
+- `DATASET_SYNC`: imported connector task, then imported identity stitcher with
+  `--batch-id` and `--job-id`.
+- Every terminal path publishes one idempotent result message for the backend
+  result worker.
+
+Validate without deployment:
+
+```sh
+.venv/bin/pytest -q tests/unit/test_connector_runtime_stack.py
+PATH="$PWD/.venv/bin:$PATH" CONFIG_FILE=env.connector.example.yaml \
+  cdk synth CdpDatabaseConnectorRuntime
+```
+
+The synthesized stack outputs the three queue URLs, occurrence DLQ ARN,
+Scheduler group/role, state machine ARN, dispatcher ARN, and KMS key ARN. Pass
+those values to the `journey-builder-api` connector worker environment. Building
+and registering the connector worker image/task revision remains a separate
+deployment step.
 
 ## Next Steps
 

@@ -1,1 +1,4 @@
-pytest==6.2.5
+pytest>=8.3,<10
+pandas>=2.2,<3
+boto3>=1.34,<2
+pglast>=7,<8
