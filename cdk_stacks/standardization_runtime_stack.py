@@ -129,7 +129,13 @@ class StandardizationRuntimeStack(Stack):
                     "warehouse_database_name", "postgres"
                 ),
                 "STANDARDIZATION_PAGE_SIZE": str(
-                    int(ecs_config.get("page_size", 2000))
+                    int(ecs_config.get("page_size", 1000))
+                ),
+                "STANDARDIZATION_LOAD_STATEMENT_TIMEOUT_SECONDS": str(
+                    int(ecs_config.get("load_statement_timeout_seconds", 900))
+                ),
+                "STANDARDIZATION_MERGE_LOCK_TIMEOUT_SECONDS": str(
+                    int(ecs_config.get("merge_lock_timeout_seconds", 1800))
                 ),
                 "AWS_REGION": Stack.of(self).region,
             },
@@ -265,7 +271,21 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
     concurrency = int(config.get("dispatcher_concurrency", 5))
     if not 2 <= concurrency <= 20:
         raise ValueError("dispatcher_concurrency must be between 2 and 20")
-    page_size = int(config["ecs"].get("page_size", 2000))
+    page_size = int(config["ecs"].get("page_size", 1000))
     if not 1000 <= page_size <= 5000:
         raise ValueError("ecs.page_size must be between 1000 and 5000")
+    statement_timeout = int(
+        config["ecs"].get("load_statement_timeout_seconds", 900)
+    )
+    if not 60 <= statement_timeout <= 3600:
+        raise ValueError(
+            "ecs.load_statement_timeout_seconds must be between 60 and 3600"
+        )
+    merge_lock_timeout = int(
+        config["ecs"].get("merge_lock_timeout_seconds", 1800)
+    )
+    if not 60 <= merge_lock_timeout <= 7200:
+        raise ValueError(
+            "ecs.merge_lock_timeout_seconds must be between 60 and 7200"
+        )
     return config

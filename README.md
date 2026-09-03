@@ -355,6 +355,30 @@ If you need to remove the stack, run:
 cdk destroy
 ```
 
+## Elasticsearch standardization runtime stack
+
+`StandardizationRuntimeStack` creates the dedicated queues, dispatcher, and
+one-shot Fargate task definition. Destination merges are serialized per source
+system inside PostgreSQL so monthly-index workers cannot block each other on
+shared customer-key tuples. For the initial large baseline use `page_size:
+1000`, `load_statement_timeout_seconds: 900`, and
+`merge_lock_timeout_seconds: 1800` in the ECS configuration. Deploying these
+values registers a new task-definition revision; already-running tasks keep
+their previous image and environment.
+
+Validate and deploy only this stack:
+
+```sh
+.venv/bin/pytest -q tests/unit/test_standardization_runtime_stack.py
+PATH="$PWD/.venv/bin:$PATH" CONFIG_FILE=env.yaml \
+  cdk diff CdpElasticsearchStandardizationRuntime
+PATH="$PWD/.venv/bin:$PATH" CONFIG_FILE=env.yaml \
+  cdk deploy CdpElasticsearchStandardizationRuntime
+```
+
+The worker image must already exist in ECR at the exact `image_uri` configured
+in `env.yaml`.
+
 ## Database connector runtime stack
 
 `ConnectorRuntimeStack` is the AWS orchestration half of database connector

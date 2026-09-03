@@ -29,6 +29,9 @@ def _config():
             "warehouse_database_secret_arn": (
                 f"arn:aws:secretsmanager:{region}:{account}:secret:warehouse-AbCdEf"
             ),
+            "page_size": 1000,
+            "load_statement_timeout_seconds": 900,
+            "merge_lock_timeout_seconds": 1800,
         },
         "backend_principal_arn": f"arn:aws:iam::{account}:role/journey-builder-api",
         "dispatcher_concurrency": 5,
@@ -53,6 +56,8 @@ def test_standardization_runtime_is_isolated_and_uses_imported_task():
     assert "ELASTICSEARCH_STANDARDIZE" not in rendered
     assert "RESULT_QUEUE_URL" in rendered
     assert "elasticsearch-standardization-worker:test" in rendered
+    assert "STANDARDIZATION_LOAD_STATEMENT_TIMEOUT_SECONDS" in rendered
+    assert "STANDARDIZATION_MERGE_LOCK_TIMEOUT_SECONDS" in rendered
 
 
 def test_standardization_dispatcher_caps_parallel_ecs_tasks():
