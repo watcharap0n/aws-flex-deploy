@@ -404,12 +404,15 @@ the image settings are absent. When enabled, `ecs.fast_worker_image_uri` and
 private ECR repository in the same AWS account and region as the stack and must
 be pinned by digest in the form
 `<account>.dkr.ecr.<region>.amazonaws.com/<repository>@sha256:<64 lowercase hex characters>`.
-The worker defaults to 1024 CPU units, 2048 MiB memory, one desired task, and a
-110-second shutdown grace period. Queue visibility defaults to 300 seconds. The
-heartbeat, long-poll, maximum-attempt, graceful-shutdown,
-oldest-message-age-alarm, and backlog-alarm settings are configurable as shown
-in the example file. The worker task receives these environment variables from
-CDK; no database credential value is stored in YAML:
+The worker defaults to 1024 CPU units, 2048 MiB memory, one desired task,
+`ecs.fast_worker_capacity_provider: FARGATE`, and a 110-second shutdown grace
+period. Set the capacity provider to `FARGATE_SPOT` to use lower-cost,
+interruptible Spot capacity; only `FARGATE` and `FARGATE_SPOT` are accepted.
+Queue visibility defaults to 300 seconds. The heartbeat, long-poll,
+maximum-attempt, graceful-shutdown, oldest-message-age-alarm, and backlog-alarm
+settings are configurable as shown in the example file. The worker task
+receives these environment variables from CDK; no database credential value is
+stored in YAML:
 
 - `AWS_REGION`
 - `DB_SECRET_NAME` (the configured warehouse secret ARN or name)

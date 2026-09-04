@@ -399,6 +399,17 @@ class ConnectorRuntimeStack(Stack):
                 ),
             },
         )
+        service_kwargs: dict[str, Any] = {}
+        if (
+            ecs_config.get("fast_worker_capacity_provider", "FARGATE")
+            == "FARGATE_SPOT"
+        ):
+            service_kwargs["capacity_provider_strategies"] = [
+                ecs.CapacityProviderStrategy(
+                    capacity_provider="FARGATE_SPOT",
+                    weight=1,
+                )
+            ]
         service = ecs.FargateService(
             self,
             "ConnectorFastWorkerService",
@@ -409,6 +420,7 @@ class ConnectorRuntimeStack(Stack):
             security_groups=security_groups,
             vpc_subnets=ec2.SubnetSelection(subnets=cluster.vpc.private_subnets),
             circuit_breaker=ecs.DeploymentCircuitBreaker(rollback=True),
+            **service_kwargs,
         )
         execution_role_policy = execution_role.node.try_find_child("DefaultPolicy")
         if execution_role_policy is None:
@@ -911,6 +923,13 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
     fast_worker_enabled = config["ecs"].get("fast_worker_enabled", False)
     if not isinstance(fast_worker_enabled, bool):
         raise ValueError("ecs.fast_worker_enabled must be a boolean")
+    capacity_provider = config["ecs"].get(
+        "fast_worker_capacity_provider", "FARGATE"
+    )
+    if capacity_provider not in {"FARGATE", "FARGATE_SPOT"}:
+        raise ValueError(
+            "ecs.fast_worker_capacity_provider must be FARGATE or FARGATE_SPOT"
+        )
     if not fast_worker_enabled:
         return config
 

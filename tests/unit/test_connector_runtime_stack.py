@@ -74,6 +74,35 @@ def test_connector_runtime_synthesizes_fast_worker_service():
     template.resource_count_is("AWS::ECS::Service", 1)
     template.resource_count_is("AWS::ECS::TaskDefinition", 1)
     template.resource_count_is("AWS::ECR::Repository", 0)
+    service = next(
+        resource
+        for resource in template.to_json()["Resources"].values()
+        if resource["Type"] == "AWS::ECS::Service"
+    )
+    assert service["Properties"]["LaunchType"] == "FARGATE"
+    assert "CapacityProviderStrategy" not in service["Properties"]
+
+
+def test_connector_runtime_synthesizes_fast_worker_on_fargate_spot():
+    app = core.App()
+    config = _config()
+    config["ecs"]["fast_worker_capacity_provider"] = "FARGATE_SPOT"
+    stack = ConnectorRuntimeStack(
+        app,
+        "ConnectorRuntimeSpotTest",
+        project_config=config,
+        env=core.Environment(account="111111111111", region="ap-southeast-1"),
+    )
+    resources = assertions.Template.from_stack(stack).to_json()["Resources"]
+    service = next(
+        resource
+        for resource in resources.values()
+        if resource["Type"] == "AWS::ECS::Service"
+    )
+    assert service["Properties"]["CapacityProviderStrategy"] == [
+        {"CapacityProvider": "FARGATE_SPOT", "Weight": 1}
+    ]
+    assert "LaunchType" not in service["Properties"]
 
 
 def test_connector_runtime_disabled_preserves_legacy_resource_shape():
@@ -584,6 +613,16 @@ def test_connector_runtime_requires_immutable_fast_worker_image():
     with pytest.raises(ValueError, match="ECR image URI pinned"):
         ConnectorRuntimeStack(
             app, "MutableConnectorImage", project_config=config
+        )
+
+
+def test_connector_runtime_rejects_unsupported_fast_worker_capacity_provider():
+    app = core.App()
+    config = _config()
+    config["ecs"]["fast_worker_capacity_provider"] = "EC2"
+    with pytest.raises(ValueError, match="must be FARGATE or FARGATE_SPOT"):
+        ConnectorRuntimeStack(
+            app, "UnsupportedConnectorCapacityProvider", project_config=config
         )
 
 
