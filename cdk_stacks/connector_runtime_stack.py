@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from aws_cdk import (
@@ -10,6 +11,7 @@ from aws_cdk import (
     Stack,
     aws_cloudwatch as cloudwatch,
     aws_ec2 as ec2,
+    aws_ecr as ecr,
     aws_ecs as ecs,
     aws_iam as iam,
     aws_kms as kms,
@@ -21,11 +23,20 @@ from aws_cdk import (
     aws_sqs as sqs,
     aws_stepfunctions as sfn,
 )
-from constructs import Construct
+from constructs import Construct, IDependable
+
+
+_ECR_DIGEST_URI_PATTERN = re.compile(
+    r"^(?P<account>\d{12})\.dkr\.ecr\.(?P<region>[a-z0-9-]+)\."
+    r"amazonaws\.com(?:\.cn)?/"
+    r"(?P<repository>[a-z0-9]+(?:[._-][a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*)@"
+    r"(?P<digest>sha256:[0-9a-f]{64})$"
+)
 
 
 class ConnectorRuntimeStack(Stack):
-    """Connector orchestration resources with ECS compute imported from configuration."""
+    """Connector orchestration with imported batch tasks and a managed warm worker."""
 
     def __init__(
         self,
@@ -108,6 +119,45 @@ class ConnectorRuntimeStack(Stack):
             "ImportedStitcherTaskDefinition",
             ecs_config["stitcher_task_definition_arn"],
         )
+        connector_role = iam.Role.from_role_arn(
+            self,
+            "ImportedConnectorTaskRole",
+            ecs_config["connector_task_role_arn"],
+            mutable=True,
+        )
+        bucket = s3.Bucket.from_bucket_name(
+            self, "ImportedConnectorLandingBucket", config["landing_bucket_name"]
+        )
+        fast_worker_resources = None
+        if ecs_config.get("fast_worker_enabled", False):
+            fast_worker_role, fast_worker_role_policy = (
+                self._create_fast_worker_task_role(
+                    fast_queue=queues["fast"],
+                    bucket=bucket,
+                    key=key,
+                    config=config,
+                )
+            )
+            (
+                fast_worker_task,
+                fast_worker_service,
+                fast_worker_logs,
+                execution_role_policy,
+            ) = self._create_fast_worker(
+                cluster=cluster,
+                security_groups=security_groups,
+                task_role=fast_worker_role,
+                fast_queue=queues["fast"],
+                key=key,
+                config=config,
+            )
+            fast_worker_service.node.add_dependency(fast_worker_role_policy)
+            fast_worker_service.node.add_dependency(execution_role_policy)
+            fast_worker_resources = (
+                fast_worker_task,
+                fast_worker_service,
+                fast_worker_logs,
+            )
 
         scheduler_role, schedule_group = self._create_scheduler(
             queues["occurrence"], queues["occurrence_dlq"], key, config
@@ -126,9 +176,11 @@ class ConnectorRuntimeStack(Stack):
         self._grant_runtime_access(
             queues=queues,
             key=key,
+            bucket=bucket,
             scheduler_role=scheduler_role,
             schedule_group=schedule_group,
             state_machine=state_machine,
+            connector_role=connector_role,
             config=config,
         )
         self._create_alarms(queues, state_machine, config)
@@ -139,6 +191,7 @@ class ConnectorRuntimeStack(Stack):
             schedule_group=schedule_group,
             state_machine=state_machine,
             dispatcher=dispatcher,
+            fast_worker_resources=fast_worker_resources,
         )
 
     def _create_queues(
@@ -146,10 +199,22 @@ class ConnectorRuntimeStack(Stack):
     ) -> dict[str, sqs.Queue]:
         retention = Duration.days(int(config.get("queue_retention_days", 14)))
 
-        def queue(name: str, *, visibility_seconds: int, dlq: sqs.Queue | None = None) -> sqs.Queue:
+        def queue(
+            name: str,
+            *,
+            visibility_seconds: int,
+            dlq: sqs.Queue | None = None,
+            fifo: bool = False,
+            max_receive_count: int | None = None,
+        ) -> sqs.Queue:
             dead_letter_queue = (
                 sqs.DeadLetterQueue(
-                    max_receive_count=int(config.get("max_receive_count", 5)), queue=dlq
+                    max_receive_count=(
+                        max_receive_count
+                        if max_receive_count is not None
+                        else int(config.get("max_receive_count", 5))
+                    ),
+                    queue=dlq,
                 )
                 if dlq
                 else None
@@ -162,12 +227,13 @@ class ConnectorRuntimeStack(Stack):
                 retention_period=retention,
                 visibility_timeout=Duration.seconds(visibility_seconds),
                 dead_letter_queue=dead_letter_queue,
+                fifo=fifo,
             )
 
         occurrence_dlq = queue("ConnectorOccurrenceDlq", visibility_seconds=60)
         dispatch_dlq = queue("ConnectorDispatchDlq", visibility_seconds=60)
         result_dlq = queue("ConnectorResultDlq", visibility_seconds=60)
-        return {
+        queues = {
             "occurrence_dlq": occurrence_dlq,
             "dispatch_dlq": dispatch_dlq,
             "result_dlq": result_dlq,
@@ -179,6 +245,175 @@ class ConnectorRuntimeStack(Stack):
             ),
             "result": queue("ConnectorResultQueue", visibility_seconds=300, dlq=result_dlq),
         }
+        if config["ecs"].get("fast_worker_enabled", False):
+            fast_dlq = queue(
+                "ConnectorFastOperationDlq", visibility_seconds=60, fifo=True
+            )
+            queues.update(
+                fast_dlq=fast_dlq,
+                fast=queue(
+                    "ConnectorFastOperationQueue",
+                    visibility_seconds=int(
+                        config.get("fast_queue_visibility_timeout_seconds", 300)
+                    ),
+                    dlq=fast_dlq,
+                    fifo=True,
+                    max_receive_count=int(
+                        config.get("fast_worker_max_attempts", 5)
+                    )
+                    + 1,
+                ),
+            )
+        return queues
+
+    def _create_fast_worker_task_role(
+        self,
+        *,
+        fast_queue: sqs.IQueue,
+        bucket: s3.IBucket,
+        key: kms.IKey,
+        config: dict[str, Any],
+    ) -> tuple[iam.Role, IDependable]:
+        role = iam.Role(
+            self,
+            "ConnectorFastWorkerTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+        )
+        bucket.grant_read_write(role)
+        role.add_to_principal_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "sqs:ReceiveMessage",
+                    "sqs:DeleteMessage",
+                    "sqs:ChangeMessageVisibility",
+                    "sqs:GetQueueAttributes",
+                ],
+                resources=[fast_queue.queue_arn],
+            )
+        )
+        key.grant_encrypt_decrypt(role)
+        role.add_to_principal_policy(
+            iam.PolicyStatement(
+                actions=["secretsmanager:GetSecretValue"],
+                resources=[
+                    config["warehouse_secret_arn"],
+                    config["connector_source_secret_arn_pattern"],
+                ],
+            )
+        )
+        policy = role.node.try_find_child("DefaultPolicy")
+        if policy is None:
+            raise RuntimeError("fast worker task role policy was not created")
+        return role, policy
+
+    def _create_fast_worker(
+        self,
+        *,
+        cluster: ecs.ICluster,
+        security_groups: list[ec2.ISecurityGroup],
+        task_role: iam.IRole,
+        fast_queue: sqs.IQueue,
+        key: kms.IKey,
+        config: dict[str, Any],
+    ) -> tuple[
+        ecs.FargateTaskDefinition,
+        ecs.FargateService,
+        logs.LogGroup,
+        IDependable,
+    ]:
+        ecs_config = config["ecs"]
+        execution_role = iam.Role(
+            self,
+            "ConnectorFastWorkerExecutionRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+        )
+        task = ecs.FargateTaskDefinition(
+            self,
+            "ConnectorFastWorkerTaskDefinition",
+            cpu=int(ecs_config.get("fast_worker_cpu", 1024)),
+            memory_limit_mib=int(
+                ecs_config.get("fast_worker_memory_limit_mib", 2048)
+            ),
+            task_role=task_role,
+            execution_role=execution_role,
+        )
+        log_group = logs.LogGroup(
+            self,
+            "ConnectorFastWorkerLogs",
+            retention=logs.RetentionDays.ONE_MONTH,
+            encryption_key=key,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        shutdown_seconds = int(config.get("fast_worker_shutdown_grace_seconds", 110))
+        image_uri = ecs_config["fast_worker_image_uri"]
+        ecr_image = _parse_ecr_digest_uri(image_uri)
+        if (
+            ecr_image.group("account") != self.account
+            or ecr_image.group("region") != self.region
+        ):
+            raise ValueError(
+                "ecs.fast_worker_image_uri must use ECR in the stack account and region"
+            )
+        repository = ecr.Repository.from_repository_attributes(
+            self,
+            "ImportedConnectorFastWorkerRepository",
+            repository_arn=(
+                f"arn:{Aws.PARTITION}:ecr:{ecr_image.group('region')}:"
+                f"{ecr_image.group('account')}:repository/"
+                f"{ecr_image.group('repository')}"
+            ),
+            repository_name=ecr_image.group("repository"),
+        )
+        container_image = ecs.ContainerImage.from_ecr_repository(
+            repository, ecr_image.group("digest")
+        )
+        task.add_container(
+            "ConnectorFastWorkerContainer",
+            container_name=ecs_config["fast_worker_container_name"],
+            image=container_image,
+            command=["consume-fast"],
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="connector-fast-worker", log_group=log_group
+            ),
+            stop_timeout=Duration.seconds(shutdown_seconds),
+            environment={
+                "AWS_REGION": Stack.of(self).region,
+                "DB_SECRET_NAME": config["warehouse_secret_arn"],
+                "CONNECTOR_LANDING_BUCKET": config["landing_bucket_name"],
+                "CONNECTOR_KMS_KEY_ID": key.key_arn,
+                "CONNECTOR_FAST_OPERATION_QUEUE_URL": fast_queue.queue_url,
+                "FAST_OPERATION_VISIBILITY_TIMEOUT_SECONDS": str(
+                    int(config.get("fast_queue_visibility_timeout_seconds", 300))
+                ),
+                "FAST_OPERATION_HEARTBEAT_SECONDS": str(
+                    int(config.get("fast_worker_heartbeat_seconds", 60))
+                ),
+                "FAST_OPERATION_POLL_WAIT_SECONDS": str(
+                    int(config.get("fast_worker_poll_wait_seconds", 20))
+                ),
+                "FAST_OPERATION_MAX_ATTEMPTS": str(
+                    int(config.get("fast_worker_max_attempts", 5))
+                ),
+                "FAST_OPERATION_SHUTDOWN_GRACE_SECONDS": str(
+                    shutdown_seconds
+                ),
+            },
+        )
+        service = ecs.FargateService(
+            self,
+            "ConnectorFastWorkerService",
+            cluster=cluster,
+            task_definition=task,
+            desired_count=int(ecs_config.get("fast_worker_desired_count", 1)),
+            assign_public_ip=False,
+            security_groups=security_groups,
+            vpc_subnets=ec2.SubnetSelection(subnets=cluster.vpc.private_subnets),
+            circuit_breaker=ecs.DeploymentCircuitBreaker(rollback=True),
+        )
+        execution_role_policy = execution_role.node.try_find_child("DefaultPolicy")
+        if execution_role_policy is None:
+            raise RuntimeError("fast worker execution role policy was not created")
+        return task, service, log_group, execution_role_policy
 
     def _create_scheduler(
         self,
@@ -494,20 +729,13 @@ class ConnectorRuntimeStack(Stack):
         *,
         queues: dict[str, sqs.Queue],
         key: kms.IKey,
+        bucket: s3.IBucket,
         scheduler_role: iam.IRole,
         schedule_group: scheduler.CfnScheduleGroup,
         state_machine: sfn.IStateMachine,
+        connector_role: iam.IRole,
         config: dict[str, Any],
     ) -> None:
-        connector_role = iam.Role.from_role_arn(
-            self,
-            "ImportedConnectorTaskRole",
-            config["ecs"]["connector_task_role_arn"],
-            mutable=True,
-        )
-        bucket = s3.Bucket.from_bucket_name(
-            self, "ImportedConnectorLandingBucket", config["landing_bucket_name"]
-        )
         bucket.grant_read_write(connector_role)
         key.grant_encrypt_decrypt(connector_role)
         connector_role.add_to_principal_policy(
@@ -527,6 +755,8 @@ class ConnectorRuntimeStack(Stack):
             mutable=True,
         )
         queues["dispatch"].grant_send_messages(backend_role)
+        if "fast" in queues:
+            queues["fast"].grant_send_messages(backend_role)
         queues["occurrence"].grant_consume_messages(backend_role)
         queues["result"].grant_consume_messages(backend_role)
         key.grant_encrypt_decrypt(backend_role)
@@ -567,6 +797,31 @@ class ConnectorRuntimeStack(Stack):
                 evaluation_periods=1,
                 alarm_description=f"Connector runtime has messages in {name}",
             )
+        if "fast" in queues:
+            cloudwatch.Alarm(
+                self,
+                "FastDlqVisibleAlarm",
+                metric=queues["fast_dlq"].metric_approximate_number_of_messages_visible(),
+                threshold=1,
+                evaluation_periods=1,
+                alarm_description="Connector runtime has messages in fast_dlq",
+            )
+            cloudwatch.Alarm(
+                self,
+                "ConnectorFastOperationOldestAgeAlarm",
+                metric=queues["fast"].metric_approximate_age_of_oldest_message(),
+                threshold=int(config.get("fast_queue_oldest_age_alarm_seconds", 120)),
+                evaluation_periods=1,
+                alarm_description="Oldest connector fast operation exceeds the target age",
+            )
+            cloudwatch.Alarm(
+                self,
+                "ConnectorFastOperationBacklogAlarm",
+                metric=queues["fast"].metric_approximate_number_of_messages_visible(),
+                threshold=int(config.get("fast_queue_backlog_alarm_threshold", 10)),
+                evaluation_periods=1,
+                alarm_description="Connector fast-operation queue backlog is elevated",
+            )
         cloudwatch.Alarm(
             self,
             "ConnectorWorkflowFailureAlarm",
@@ -584,6 +839,10 @@ class ConnectorRuntimeStack(Stack):
         schedule_group: scheduler.CfnScheduleGroup,
         state_machine: sfn.IStateMachine,
         dispatcher: lambda_.IFunction,
+        fast_worker_resources: tuple[
+            ecs.FargateTaskDefinition, ecs.FargateService, logs.ILogGroup
+        ]
+        | None,
     ) -> None:
         values = {
             "ConnectorOccurrenceQueueUrl": queues["occurrence"].queue_url,
@@ -596,6 +855,22 @@ class ConnectorRuntimeStack(Stack):
             "ConnectorDispatcherArn": dispatcher.function_arn,
             "ConnectorRuntimeKmsKeyArn": key.key_arn,
         }
+        if fast_worker_resources is not None:
+            fast_worker_task, fast_worker_service, fast_worker_logs = (
+                fast_worker_resources
+            )
+            values.update(
+                ConnectorFastOperationQueueUrl=queues["fast"].queue_url,
+                ConnectorFastOperationQueueArn=queues["fast"].queue_arn,
+                ConnectorFastOperationDlqArn=queues["fast_dlq"].queue_arn,
+                ConnectorFastWorkerServiceName=fast_worker_service.service_name,
+                ConnectorFastWorkerServiceArn=fast_worker_service.service_arn,
+                ConnectorFastWorkerTaskDefinitionArn=(
+                    fast_worker_task.task_definition_arn
+                ),
+                ConnectorFastWorkerLogGroupName=fast_worker_logs.log_group_name,
+                ConnectorFastWorkerLogGroupArn=fast_worker_logs.log_group_arn,
+            )
         for name, value in values.items():
             CfnOutput(self, name, value=value)
 
@@ -633,4 +908,53 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 f"connector runtime {section} config missing: " + ", ".join(absent)
             )
+    fast_worker_enabled = config["ecs"].get("fast_worker_enabled", False)
+    if not isinstance(fast_worker_enabled, bool):
+        raise ValueError("ecs.fast_worker_enabled must be a boolean")
+    if not fast_worker_enabled:
+        return config
+
+    fast_required = ["fast_worker_image_uri", "fast_worker_container_name"]
+    fast_missing = [name for name in fast_required if not config["ecs"].get(name)]
+    if fast_missing:
+        raise ValueError(
+            "connector runtime ecs config missing: " + ", ".join(fast_missing)
+        )
+    _parse_ecr_digest_uri(str(config["ecs"]["fast_worker_image_uri"]))
+
+    visibility = int(config.get("fast_queue_visibility_timeout_seconds", 300))
+    heartbeat = int(config.get("fast_worker_heartbeat_seconds", 60))
+    poll_wait = int(config.get("fast_worker_poll_wait_seconds", 20))
+    max_attempts = int(config.get("fast_worker_max_attempts", 5))
+    shutdown_grace = int(config.get("fast_worker_shutdown_grace_seconds", 110))
+    desired_count = int(config["ecs"].get("fast_worker_desired_count", 1))
+    if not 1 <= visibility <= 43_200:
+        raise ValueError(
+            "fast_queue_visibility_timeout_seconds must be between 1 and 43200"
+        )
+    if heartbeat < 1 or heartbeat * 2 > visibility:
+        raise ValueError(
+            "fast_worker_heartbeat_seconds must be positive and no more than half "
+            "the queue visibility timeout"
+        )
+    if not 1 <= poll_wait <= 20:
+        raise ValueError("fast_worker_poll_wait_seconds must be between 1 and 20")
+    if not 1 <= max_attempts <= 1_000:
+        raise ValueError("fast_worker_max_attempts must be between 1 and 1000")
+    if not 2 <= shutdown_grace <= 120:
+        raise ValueError(
+            "fast_worker_shutdown_grace_seconds must be between 2 and 120"
+        )
+    if desired_count < 0:
+        raise ValueError("ecs.fast_worker_desired_count must not be negative")
     return config
+
+
+def _parse_ecr_digest_uri(image_uri: str) -> re.Match[str]:
+    match = _ECR_DIGEST_URI_PATTERN.fullmatch(image_uri)
+    if match is None:
+        raise ValueError(
+            "ecs.fast_worker_image_uri must be an ECR image URI pinned to a "
+            "lowercase sha256 digest"
+        )
+    return match

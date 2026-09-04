@@ -384,20 +384,60 @@ in `env.yaml`.
 `ConnectorRuntimeStack` is the AWS orchestration half of database connector
 intake. It creates encrypted occurrence/dispatch/result queues and DLQs,
 EventBridge Scheduler group/role, an idempotent dispatch Lambda, a Standard Step
-Functions workflow, logs, alarms, and least-privilege IAM policies.
+Functions workflow, logs, alarms, and least-privilege IAM policies. When the
+fast worker is enabled, it additionally creates a FIFO fast-operation queue and
+FIFO DLQ.
 
-The stack deliberately imports the ECS cluster, connector task definition,
-identity stitcher task definition, container names, and task/pass roles. It does
-not create an ECS service, task definition, cluster, ECR repository, or image.
-Copy [env.connector.example.yaml](env.connector.example.yaml) and replace every
+The stack imports the ECS cluster, existing one-shot connector and identity
+stitcher task definitions, network references, and connector task role. When
+`ecs.fast_worker_enabled` is `true`, it also creates a dedicated task role, task
+definition, and continuously running Fargate service for fast operations. The
+service runs `consume-fast` in private subnets without a public IP or load
+balancer and uses ECS deployment-circuit-breaker rollback. The stack does not
+create an ECS cluster, ECR repository, or container image. Copy
+[env.connector.example.yaml](env.connector.example.yaml) and replace every
 placeholder with an existing reference before synth or deployment.
 
-The workflow routes operations as follows:
+`ecs.fast_worker_enabled` defaults to `false`, preserving the legacy stack when
+the image settings are absent. When enabled, `ecs.fast_worker_image_uri` and
+`ecs.fast_worker_container_name` are required. The image URI must reference a
+private ECR repository in the same AWS account and region as the stack and must
+be pinned by digest in the form
+`<account>.dkr.ecr.<region>.amazonaws.com/<repository>@sha256:<64 lowercase hex characters>`.
+The worker defaults to 1024 CPU units, 2048 MiB memory, one desired task, and a
+110-second shutdown grace period. Queue visibility defaults to 300 seconds. The
+heartbeat, long-poll, maximum-attempt, graceful-shutdown,
+oldest-message-age-alarm, and backlog-alarm settings are configurable as shown
+in the example file. The worker task receives these environment variables from
+CDK; no database credential value is stored in YAML:
 
-- `CONNECTION_TEST`, `SCHEMA_DISCOVERY`, and `DATASET_PREVIEW`: imported
-  connector task only.
+- `AWS_REGION`
+- `DB_SECRET_NAME` (the configured warehouse secret ARN or name)
+- `CONNECTOR_LANDING_BUCKET`
+- `CONNECTOR_KMS_KEY_ID`
+- `CONNECTOR_FAST_OPERATION_QUEUE_URL`
+- `FAST_OPERATION_VISIBILITY_TIMEOUT_SECONDS`
+- `FAST_OPERATION_HEARTBEAT_SECONDS`
+- `FAST_OPERATION_POLL_WAIT_SECONDS`
+- `FAST_OPERATION_MAX_ATTEMPTS`
+- `FAST_OPERATION_SHUTDOWN_GRACE_SECONDS`
+
+The heartbeat must be no more than half the queue visibility timeout. The FIFO
+queue redrive count is `fast_worker_max_attempts + 1`: the first deliveries are
+execution attempts, and the final source delivery is reserved for claim logic
+to persist `MAX_EXECUTION_ATTEMPTS` before acknowledging the message. The ECS
+container `StopTimeout` is the configured
+`fast_worker_shutdown_grace_seconds` value.
+
+Runtime routing is split as follows:
+
+- `CONNECTION_TEST`, `SCHEMA_DISCOVERY`, and `DATASET_PREVIEW`: the API sends
+  directly to the FIFO fast-operation queue for the warm worker. The existing
+  dispatch queue, dispatcher Lambda, and Step Functions route remain available
+  as fallback.
 - `DATASET_SYNC`: imported connector task, then imported identity stitcher with
-  `--batch-id` and `--job-id`.
+  `--batch-id` and `--job-id` through the existing dispatch and Step Functions
+  path.
 - Every terminal path publishes one idempotent result message for the backend
   result worker.
 
@@ -409,11 +449,25 @@ PATH="$PWD/.venv/bin:$PATH" CONFIG_FILE=env.connector.example.yaml \
   cdk synth CdpDatabaseConnectorRuntime
 ```
 
-The synthesized stack outputs the three queue URLs, occurrence DLQ ARN,
-Scheduler group/role, state machine ARN, dispatcher ARN, and KMS key ARN. Pass
-those values to the `journey-builder-api` connector worker environment. Building
-and registering the connector worker image/task revision remains a separate
-deployment step.
+The synthesized stack additionally outputs the fast-operation queue URL and
+ARN, fast-operation DLQ ARN, fast-worker ECS service name and ARN, task
+definition ARN, and log group name and ARN. Configure the API with the fast
+queue URL; its imported backend role can send to both the existing dispatch
+queue and the new FIFO queue. Building and publishing the digest-pinned worker
+image remains a separate deployment step.
+
+Use an additive rollout:
+
+1. Publish the worker image and configure `ecs.fast_worker_enabled: true` with
+   its immutable digest.
+2. Keep `CONNECTOR_FAST_OPERATIONS_ENABLED=false` on `journey-builder-api`
+   while deploying this infrastructure and verifying that the warm ECS task is
+   healthy.
+3. Configure the API with both
+   `CONNECTOR_FAST_OPERATION_QUEUE_URL=<ConnectorFastOperationQueueUrl output>`
+   and `CONNECTOR_FAST_OPERATIONS_ENABLED=true` to enable direct routing.
+4. Keep the existing dispatch worker, Lambda, and Step Functions resources in
+   place for fallback and `DATASET_SYNC`.
 
 ## Next Steps
 
