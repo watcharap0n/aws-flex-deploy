@@ -29,9 +29,12 @@ def _config():
             "warehouse_database_secret_arn": (
                 f"arn:aws:secretsmanager:{region}:{account}:secret:warehouse-AbCdEf"
             ),
-            "page_size": 1000,
-            "load_statement_timeout_seconds": 900,
+            "cpu": 2048,
+            "memory_limit_mib": 4096,
+            "page_size": 5000,
+            "load_statement_timeout_seconds": 1800,
             "merge_lock_timeout_seconds": 1800,
+            "stop_timeout_seconds": 120,
         },
         "backend_principal_arn": f"arn:aws:iam::{account}:role/journey-builder-api",
         "dispatcher_concurrency": 5,
@@ -58,6 +61,35 @@ def test_standardization_runtime_is_isolated_and_uses_imported_task():
     assert "elasticsearch-standardization-worker:test" in rendered
     assert "STANDARDIZATION_LOAD_STATEMENT_TIMEOUT_SECONDS" in rendered
     assert "STANDARDIZATION_MERGE_LOCK_TIMEOUT_SECONDS" in rendered
+    template.has_resource_properties(
+        "AWS::ECS::TaskDefinition",
+        {
+            "Cpu": "2048",
+            "Memory": "4096",
+            "ContainerDefinitions": assertions.Match.array_with(
+                [
+                    assertions.Match.object_like(
+                        {
+                            "Name": "elasticsearch-standardization-worker",
+                            "StopTimeout": 120,
+                            "Environment": assertions.Match.array_with(
+                                [
+                                    {
+                                        "Name": "STANDARDIZATION_PAGE_SIZE",
+                                        "Value": "5000",
+                                    },
+                                    {
+                                        "Name": "STANDARDIZATION_LOAD_STATEMENT_TIMEOUT_SECONDS",
+                                        "Value": "1800",
+                                    },
+                                ]
+                            ),
+                        }
+                    )
+                ]
+            ),
+        },
+    )
 
 
 def test_standardization_dispatcher_caps_parallel_ecs_tasks():

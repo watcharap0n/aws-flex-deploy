@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "PROJECT_MEMORY.md"
+  ],
+  "references": {
+    "identity-resolution": {
+      "path": "/Users/kmac15/PycharmProjects/identity-resolution",
+      "description": "CDP identity research, standardized-data design, and ClickHouse publication workbench; not the production stitcher"
+    },
+    "journey-builder-api": {
+      "path": "/Users/kmac15/PycharmProjects/journey-builder-api",
+      "description": "CDP connector and Elasticsearch standardization control-plane API and workers"
+    },
+    "journey-builder": {
+      "path": "/Users/kmac15/PycharmProjects/journey-builder",
+      "description": "Separate Temporal and Kafka journey orchestration platform"
+    },
+    "database-connector-worker": {
+      "path": "/Users/kmac15/PycharmProjects/cdp-database-connector-worker",
+      "description": "Database extraction, S3 landing, and customer ingestion Fargate worker"
+    },
+    "elasticsearch-standardization-worker": {
+      "path": "/Users/kmac15/PycharmProjects/cdp-elasticsearch-standardization-worker",
+      "description": "PostgreSQL-backed Elasticsearch migration standardization Fargate worker"
+    },
+    "user-stitching": {
+      "path": "/Users/kmac15/PycharmProjects/fargate-user-stitching",
+      "description": "Production CDP customer validation and identity-stitching Fargate worker"
+    }
+  }
+}

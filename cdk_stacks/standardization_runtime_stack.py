@@ -92,8 +92,8 @@ class StandardizationRuntimeStack(Stack):
         task = ecs.FargateTaskDefinition(
             self,
             "StandardizationTaskDefinition",
-            cpu=int(ecs_config.get("cpu", 1024)),
-            memory_limit_mib=int(ecs_config.get("memory_limit_mib", 2048)),
+            cpu=int(ecs_config.get("cpu", 2048)),
+            memory_limit_mib=int(ecs_config.get("memory_limit_mib", 4096)),
             task_role=task_role,
             execution_role=execution_role,
         )
@@ -121,6 +121,9 @@ class StandardizationRuntimeStack(Stack):
                 stream_prefix="elasticsearch-standardization",
                 log_group=task_logs,
             ),
+            stop_timeout=Duration.seconds(
+                int(ecs_config.get("stop_timeout_seconds", 120))
+            ),
             environment={
                 "SOURCE_DATABASE_NAME": ecs_config.get(
                     "source_database_name", "elasticsearch"
@@ -129,10 +132,10 @@ class StandardizationRuntimeStack(Stack):
                     "warehouse_database_name", "postgres"
                 ),
                 "STANDARDIZATION_PAGE_SIZE": str(
-                    int(ecs_config.get("page_size", 1000))
+                    int(ecs_config.get("page_size", 5000))
                 ),
                 "STANDARDIZATION_LOAD_STATEMENT_TIMEOUT_SECONDS": str(
-                    int(ecs_config.get("load_statement_timeout_seconds", 900))
+                    int(ecs_config.get("load_statement_timeout_seconds", 1800))
                 ),
                 "STANDARDIZATION_MERGE_LOCK_TIMEOUT_SECONDS": str(
                     int(ecs_config.get("merge_lock_timeout_seconds", 1800))
@@ -271,11 +274,11 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
     concurrency = int(config.get("dispatcher_concurrency", 5))
     if not 2 <= concurrency <= 20:
         raise ValueError("dispatcher_concurrency must be between 2 and 20")
-    page_size = int(config["ecs"].get("page_size", 1000))
+    page_size = int(config["ecs"].get("page_size", 5000))
     if not 1000 <= page_size <= 5000:
         raise ValueError("ecs.page_size must be between 1000 and 5000")
     statement_timeout = int(
-        config["ecs"].get("load_statement_timeout_seconds", 900)
+        config["ecs"].get("load_statement_timeout_seconds", 1800)
     )
     if not 60 <= statement_timeout <= 3600:
         raise ValueError(
@@ -288,4 +291,7 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "ecs.merge_lock_timeout_seconds must be between 60 and 7200"
         )
+    stop_timeout = int(config["ecs"].get("stop_timeout_seconds", 120))
+    if not 30 <= stop_timeout <= 120:
+        raise ValueError("ecs.stop_timeout_seconds must be between 30 and 120")
     return config
