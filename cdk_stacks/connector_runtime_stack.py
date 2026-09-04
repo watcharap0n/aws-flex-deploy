@@ -219,16 +219,16 @@ class ConnectorRuntimeStack(Stack):
                 if dlq
                 else None
             )
-            return sqs.Queue(
-                self,
-                name,
-                encryption=sqs.QueueEncryption.KMS,
-                encryption_master_key=key,
-                retention_period=retention,
-                visibility_timeout=Duration.seconds(visibility_seconds),
-                dead_letter_queue=dead_letter_queue,
-                fifo=fifo,
-            )
+            queue_kwargs: dict[str, Any] = {
+                "encryption": sqs.QueueEncryption.KMS,
+                "encryption_master_key": key,
+                "retention_period": retention,
+                "visibility_timeout": Duration.seconds(visibility_seconds),
+                "dead_letter_queue": dead_letter_queue,
+            }
+            if fifo:
+                queue_kwargs["fifo"] = True
+            return sqs.Queue(self, name, **queue_kwargs)
 
         occurrence_dlq = queue("ConnectorOccurrenceDlq", visibility_seconds=60)
         dispatch_dlq = queue("ConnectorDispatchDlq", visibility_seconds=60)
