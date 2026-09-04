@@ -204,7 +204,7 @@ class ConnectorRuntimeStack(Stack):
             *,
             visibility_seconds: int,
             dlq: sqs.Queue | None = None,
-            fifo: bool = False,
+            fifo: bool | None = False,
             max_receive_count: int | None = None,
         ) -> sqs.Queue:
             dead_letter_queue = (
@@ -247,7 +247,7 @@ class ConnectorRuntimeStack(Stack):
         }
         if config["ecs"].get("fast_worker_enabled", False):
             fast_dlq = queue(
-                "ConnectorFastOperationDlq", visibility_seconds=60, fifo=True
+                "ConnectorFastOperationDlq", visibility_seconds=60, fifo=None
             )
             queues.update(
                 fast_dlq=fast_dlq,
@@ -257,7 +257,7 @@ class ConnectorRuntimeStack(Stack):
                         config.get("fast_queue_visibility_timeout_seconds", 300)
                     ),
                     dlq=fast_dlq,
-                    fifo=True,
+                    fifo=None,
                     max_receive_count=int(
                         config.get("fast_worker_max_attempts", 5)
                     )

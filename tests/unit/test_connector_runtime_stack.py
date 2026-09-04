@@ -141,7 +141,7 @@ def test_state_machine_routes_dataset_preview_to_connector_worker():
     )
 
 
-def test_fast_operation_fifo_queue_uses_kms_retention_and_redrive():
+def test_fast_operation_standard_queue_uses_kms_retention_and_redrive():
     app = core.App()
     config = _config()
     config["queue_retention_days"] = 10
@@ -166,14 +166,18 @@ def test_fast_operation_fifo_queue_uses_kms_retention_and_redrive():
         if logical_id.startswith("ConnectorFastOperationQueue")
         and resource["Type"] == "AWS::SQS::Queue"
     )
-    assert resources[fast_dlq_id]["Properties"]["FifoQueue"] is True
-    assert fast_queue["Properties"]["FifoQueue"] is True
+    fast_dlq = resources[fast_dlq_id]
+    assert "FifoQueue" not in fast_dlq["Properties"]
+    assert "FifoQueue" not in fast_queue["Properties"]
+    assert "Fn::GetAtt" in fast_dlq["Properties"]["KmsMasterKeyId"]
     assert "Fn::GetAtt" in fast_queue["Properties"]["KmsMasterKeyId"]
+    assert fast_dlq["Properties"]["MessageRetentionPeriod"] == 864000
     assert fast_queue["Properties"]["MessageRetentionPeriod"] == 864000
     assert fast_queue["Properties"]["RedrivePolicy"] == {
         "deadLetterTargetArn": {"Fn::GetAtt": [fast_dlq_id, "Arn"]},
         "maxReceiveCount": 8,
     }
+    assert fast_dlq["Properties"]["VisibilityTimeout"] == 60
     assert fast_queue["Properties"]["VisibilityTimeout"] == 420
 
 

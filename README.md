@@ -385,8 +385,8 @@ in `env.yaml`.
 intake. It creates encrypted occurrence/dispatch/result queues and DLQs,
 EventBridge Scheduler group/role, an idempotent dispatch Lambda, a Standard Step
 Functions workflow, logs, alarms, and least-privilege IAM policies. When the
-fast worker is enabled, it additionally creates a FIFO fast-operation queue and
-FIFO DLQ.
+fast worker is enabled, it additionally creates a standard fast-operation queue
+and standard DLQ.
 
 The stack imports the ECS cluster, existing one-shot connector and identity
 stitcher task definitions, network references, and connector task role. When
@@ -422,19 +422,21 @@ CDK; no database credential value is stored in YAML:
 - `FAST_OPERATION_MAX_ATTEMPTS`
 - `FAST_OPERATION_SHUTDOWN_GRACE_SECONDS`
 
-The heartbeat must be no more than half the queue visibility timeout. The FIFO
+The heartbeat must be no more than half the queue visibility timeout. The
 queue redrive count is `fast_worker_max_attempts + 1`: the first deliveries are
 execution attempts, and the final source delivery is reserved for claim logic
 to persist `MAX_EXECUTION_ATTEMPTS` before acknowledging the message. The ECS
 container `StopTimeout` is the configured
-`fast_worker_shutdown_grace_seconds` value.
+`fast_worker_shutdown_grace_seconds` value. Standard SQS can redeliver a
+message, so the worker's database atomic lease provides idempotency by allowing
+only one active claim for an operation.
 
 Runtime routing is split as follows:
 
 - `CONNECTION_TEST`, `SCHEMA_DISCOVERY`, and `DATASET_PREVIEW`: the API sends
-  directly to the FIFO fast-operation queue for the warm worker. The existing
-  dispatch queue, dispatcher Lambda, and Step Functions route remain available
-  as fallback.
+  directly to the standard fast-operation queue for the warm worker. The
+  existing dispatch queue, dispatcher Lambda, and Step Functions route remain
+  available as fallback.
 - `DATASET_SYNC`: imported connector task, then imported identity stitcher with
   `--batch-id` and `--job-id` through the existing dispatch and Step Functions
   path.
@@ -453,8 +455,8 @@ The synthesized stack additionally outputs the fast-operation queue URL and
 ARN, fast-operation DLQ ARN, fast-worker ECS service name and ARN, task
 definition ARN, and log group name and ARN. Configure the API with the fast
 queue URL; its imported backend role can send to both the existing dispatch
-queue and the new FIFO queue. Building and publishing the digest-pinned worker
-image remains a separate deployment step.
+queue and the new standard queue. Building and publishing the digest-pinned
+worker image remains a separate deployment step.
 
 Use an additive rollout:
 
