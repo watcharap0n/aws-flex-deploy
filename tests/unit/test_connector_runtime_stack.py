@@ -140,6 +140,77 @@ def test_state_machine_runs_connector_then_stitcher_for_sync():
     assert "--job-id" in rendered
     assert "$.task_result" in rendered
 
+    state_machine = next(
+        resource
+        for resource in template["Resources"].values()
+        if resource["Type"] == "AWS::StepFunctions::StateMachine"
+    )
+    states = state_machine["Properties"]["Definition"]["States"]
+    for state_name in (
+        "RunConnectorOperation",
+        "ExtractAndLoadConnectorDataset",
+        "RunImportedIdentityStitcher",
+    ):
+        state = states[state_name]
+        assert state["Parameters"]["LaunchType"] == "FARGATE"
+        assert "CapacityProviderStrategy" not in state["Parameters"]
+        assert state["Retry"] == [
+            {
+                "ErrorEquals": ["ECS.AmazonECSException"],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 20,
+                "BackoffRate": 1.2,
+                "MaxDelaySeconds": 60,
+            }
+        ]
+        assert list(state).index("Retry") < list(state).index("Catch")
+
+
+def test_state_machine_uses_fargate_spot_and_configured_ecs_retry():
+    app = core.App()
+    config = _config()
+    config["ecs"].update(
+        {
+            "workflow_capacity_provider": "FARGATE_SPOT",
+            "workflow_retry_interval_seconds": 10,
+            "workflow_retry_max_attempts": 8,
+            "workflow_retry_backoff_rate": 1.5,
+            "workflow_retry_max_delay_seconds": 45,
+        }
+    )
+    stack = ConnectorRuntimeStack(
+        app,
+        "ConnectorRuntimeWorkflowSpotTest",
+        project_config=config,
+        env=core.Environment(account="111111111111", region="ap-southeast-1"),
+    )
+    resources = assertions.Template.from_stack(stack).to_json()["Resources"]
+    state_machine = next(
+        resource
+        for resource in resources.values()
+        if resource["Type"] == "AWS::StepFunctions::StateMachine"
+    )
+    states = state_machine["Properties"]["Definition"]["States"]
+    for state_name in (
+        "RunConnectorOperation",
+        "ExtractAndLoadConnectorDataset",
+        "RunImportedIdentityStitcher",
+    ):
+        state = states[state_name]
+        assert state["Parameters"]["CapacityProviderStrategy"] == [
+            {"CapacityProvider": "FARGATE_SPOT", "Weight": 1, "Base": 0}
+        ]
+        assert "LaunchType" not in state["Parameters"]
+        assert state["Retry"] == [
+            {
+                "ErrorEquals": ["ECS.AmazonECSException"],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 8,
+                "BackoffRate": 1.5,
+                "MaxDelaySeconds": 45,
+            }
+        ]
+
 
 def test_state_machine_routes_dataset_preview_to_connector_worker():
     app = core.App()
@@ -624,6 +695,35 @@ def test_connector_runtime_rejects_unsupported_fast_worker_capacity_provider():
         ConnectorRuntimeStack(
             app, "UnsupportedConnectorCapacityProvider", project_config=config
         )
+
+
+def test_connector_runtime_rejects_unsupported_workflow_capacity_provider():
+    app = core.App()
+    config = _config()
+    config["ecs"]["workflow_capacity_provider"] = "EC2"
+    with pytest.raises(
+        ValueError, match="ecs.workflow_capacity_provider must be FARGATE or FARGATE_SPOT"
+    ):
+        ConnectorRuntimeStack(
+            app, "UnsupportedWorkflowCapacityProvider", project_config=config
+        )
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "workflow_retry_interval_seconds",
+        "workflow_retry_max_attempts",
+        "workflow_retry_backoff_rate",
+        "workflow_retry_max_delay_seconds",
+    ],
+)
+def test_connector_runtime_requires_positive_workflow_retry_values(setting):
+    app = core.App()
+    config = _config()
+    config["ecs"][setting] = 0
+    with pytest.raises(ValueError, match=rf"ecs\.{setting} must be positive"):
+        ConnectorRuntimeStack(app, "InvalidWorkflowRetry", project_config=config)
 
 
 def test_connector_runtime_requires_two_heartbeat_intervals_per_visibility():

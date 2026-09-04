@@ -541,6 +541,27 @@ class ConnectorRuntimeStack(Stack):
                 "Next": "PrepareFailureResult",
             }
         ]
+        ecs_config = config["ecs"]
+        workflow_capacity_provider = ecs_config.get(
+            "workflow_capacity_provider", "FARGATE"
+        )
+        ecs_retry = [
+            {
+                "ErrorEquals": ["ECS.AmazonECSException"],
+                "IntervalSeconds": int(
+                    ecs_config.get("workflow_retry_interval_seconds", 15)
+                ),
+                "MaxAttempts": int(
+                    ecs_config.get("workflow_retry_max_attempts", 20)
+                ),
+                "BackoffRate": float(
+                    ecs_config.get("workflow_retry_backoff_rate", 1.2)
+                ),
+                "MaxDelaySeconds": int(
+                    ecs_config.get("workflow_retry_max_delay_seconds", 60)
+                ),
+            }
+        ]
 
         def ecs_state(
             task_definition_arn: str,
@@ -548,24 +569,35 @@ class ConnectorRuntimeStack(Stack):
             command_expression: str,
             next_state: str,
         ) -> dict[str, Any]:
+            parameters = {
+                "Cluster": cluster_arn,
+                "TaskDefinition": task_definition_arn,
+                "NetworkConfiguration": network,
+                "Overrides": {
+                    "ContainerOverrides": [
+                        {
+                            "Name": container_name,
+                            "Command.$": command_expression,
+                        }
+                    ]
+                },
+            }
+            if workflow_capacity_provider == "FARGATE_SPOT":
+                parameters["CapacityProviderStrategy"] = [
+                    {
+                        "CapacityProvider": "FARGATE_SPOT",
+                        "Weight": 1,
+                        "Base": 0,
+                    }
+                ]
+            else:
+                parameters["LaunchType"] = "FARGATE"
             return {
                 "Type": "Task",
                 "Resource": "arn:aws:states:::ecs:runTask.sync",
-                "Parameters": {
-                    "Cluster": cluster_arn,
-                    "TaskDefinition": task_definition_arn,
-                    "LaunchType": "FARGATE",
-                    "NetworkConfiguration": network,
-                    "Overrides": {
-                        "ContainerOverrides": [
-                            {
-                                "Name": container_name,
-                                "Command.$": command_expression,
-                            }
-                        ]
-                    },
-                },
+                "Parameters": parameters,
                 "ResultPath": "$.task_result",
+                "Retry": ecs_retry,
                 "Catch": catch_all,
                 "Next": next_state,
             }
@@ -930,6 +962,30 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "ecs.fast_worker_capacity_provider must be FARGATE or FARGATE_SPOT"
         )
+    workflow_capacity_provider = config["ecs"].get(
+        "workflow_capacity_provider", "FARGATE"
+    )
+    if workflow_capacity_provider not in {"FARGATE", "FARGATE_SPOT"}:
+        raise ValueError(
+            "ecs.workflow_capacity_provider must be FARGATE or FARGATE_SPOT"
+        )
+    workflow_retry_values = {
+        "workflow_retry_interval_seconds": int(
+            config["ecs"].get("workflow_retry_interval_seconds", 15)
+        ),
+        "workflow_retry_max_attempts": int(
+            config["ecs"].get("workflow_retry_max_attempts", 20)
+        ),
+        "workflow_retry_backoff_rate": float(
+            config["ecs"].get("workflow_retry_backoff_rate", 1.2)
+        ),
+        "workflow_retry_max_delay_seconds": int(
+            config["ecs"].get("workflow_retry_max_delay_seconds", 60)
+        ),
+    }
+    for name, value in workflow_retry_values.items():
+        if value <= 0:
+            raise ValueError(f"ecs.{name} must be positive")
     if not fast_worker_enabled:
         return config
 

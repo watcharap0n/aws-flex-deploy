@@ -434,6 +434,18 @@ container `StopTimeout` is the configured
 message, so the worker's database atomic lease provides idempotency by allowing
 only one active claim for an operation.
 
+The one-shot connector and stitcher tasks default to
+`ecs.workflow_capacity_provider: FARGATE`, which preserves the existing
+`LaunchType: FARGATE` workflow definition. Setting it to `FARGATE_SPOT` instead
+uses an ECS capacity-provider strategy and omits `LaunchType`. Use Spot only as
+a temporary quota fallback, then switch the setting to `FARGATE` after the
+Fargate quota increase is approved. Each workflow ECS task retries
+`ECS.AmazonECSException` before its existing catch path. The retry defaults are
+15 seconds, 20 attempts, a 1.2 backoff rate, and a 60-second maximum delay;
+configure them with `ecs.workflow_retry_interval_seconds`,
+`ecs.workflow_retry_max_attempts`, `ecs.workflow_retry_backoff_rate`, and
+`ecs.workflow_retry_max_delay_seconds`. All four values must be positive.
+
 Runtime routing is split as follows:
 
 - `CONNECTION_TEST`, `SCHEMA_DISCOVERY`, and `DATASET_PREVIEW`: the API sends
