@@ -230,6 +230,64 @@ def test_status_follows_retry_chain_and_hides_transient_lock_failure(db):
     assert result['status']=='SUCCEEDED' and result['job_id']==replacement
 
 
+@pytest.mark.parametrize('ingestion_status,has_validation', [
+    ('queued', False), ('queued', True), ('completed', False),
+])
+def test_old_ineligible_queue_does_not_raise_overdue(monkeypatch, db, caplog, ingestion_status, has_validation):
+    mod=load();adm=admission_module();ecs=Ecs()
+    with db,db.cursor() as q:q.execute((ROOT/'database/migrations/018_stitching_admission.sql').read_text())
+    batch,job=seed(db)
+    with db,db.cursor() as q:
+        q.execute('UPDATE control.ingestion_batch SET status=%s WHERE batch_id=%s',(ingestion_status,batch))
+        q.execute("UPDATE control.stitching_job SET created_at=now()-interval '25 hours' WHERE job_id=%s",(job,))
+        if not has_validation:
+            q.execute('DELETE FROM quality.customer_validation_run WHERE stitching_job_id=%s',(job,))
+    monkeypatch.setenv('ECS_CLUSTER','test')
+    monkeypatch.setattr(mod,'boto3',type('Aws',(),{'client':staticmethod(lambda _:ecs)}))
+    monkeypatch.setattr(mod,'_start_stitching_task',lambda *a,**kw:pytest.fail('ineligible work must remain queued'))
+    assert adm.tick(db,mod)=={'status':'idle'}
+    assert 'stitching_admission_overdue' not in caplog.text
+    with db.cursor() as q:
+        q.execute('SELECT status,ecs_task_arn,error_code FROM control.stitching_job WHERE job_id=%s',(job,))
+        assert q.fetchone()==('QUEUED',None,None)
+        q.execute('SELECT count(*) FROM control.stitching_admission WHERE job_id=%s',(job,))
+        assert q.fetchone()[0]==0
+
+
+@pytest.mark.parametrize('status', ['QUEUED', 'SUBMITTED', 'WAITING_FOR_LOCK', 'VALIDATING', 'RUNNING'])
+def test_old_eligible_or_active_work_alerts_without_touching_writer(monkeypatch, db, caplog, status):
+    mod=load();adm=admission_module();ecs=Ecs()
+    batch,job=seed(db)
+    task_arn=None if status=='QUEUED' else 'active-task'
+    with db,db.cursor() as q:
+        q.execute("UPDATE control.stitching_job SET status=%s,ecs_task_arn=%s,created_at=now()-interval '25 hours' WHERE job_id=%s",(status,task_arn,job))
+        if task_arn:
+            # Already-active work must not disappear behind ingestion gates.
+            q.execute("UPDATE control.ingestion_batch SET status='queued' WHERE batch_id=%s",(batch,))
+            q.execute('DELETE FROM quality.customer_validation_run WHERE stitching_job_id=%s',(job,))
+    monkeypatch.setenv('ECS_CLUSTER','test')
+    monkeypatch.setattr(mod,'boto3',type('Aws',(),{'client':staticmethod(lambda _:ecs)}))
+    monkeypatch.setattr(mod,'_start_stitching_task',lambda *a,**kw:pytest.fail('must not launch around writer'))
+    holder=psycopg2.connect(os.environ['CDP_TEST_DSN'])
+    try:
+        with holder.cursor() as q:q.execute('SELECT pg_advisory_lock(%s)',(adm.WRITER_LOCK,))
+        with pytest.raises(RuntimeError,match='Stitching completion overdue; work retained and writer untouched'):
+            adm.tick(db,mod)
+        assert 'stitching_admission_overdue work_retained=true' in caplog.text
+        with db.cursor() as q:
+            q.execute('SELECT status,ecs_task_arn,error_code FROM control.stitching_job WHERE job_id=%s',(job,))
+            assert q.fetchone()==(status,task_arn,None)
+            q.execute('SELECT pg_try_advisory_lock(%s)',(adm.WRITER_LOCK,))
+            assert q.fetchone()==(False,)
+            q.execute('SELECT pg_try_advisory_lock(%s)',(adm.ADMISSION_LOCK,))
+            assert q.fetchone()==(True,)
+            q.execute('SELECT pg_advisory_unlock(%s)',(adm.ADMISSION_LOCK,))
+        with holder.cursor() as q:
+            q.execute('SELECT pg_try_advisory_lock(%s)',(adm.ADMISSION_LOCK,))
+            assert q.fetchone()==(True,)
+    finally:holder.close()
+
+
 def test_unmanaged_historical_jobs_do_not_block_current_admission(monkeypatch,db):
     mod=load();adm=admission_module();ecs=Ecs()
     with db,db.cursor() as q:q.execute((ROOT/'database/migrations/018_stitching_admission.sql').read_text())

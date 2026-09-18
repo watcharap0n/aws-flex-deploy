@@ -62,11 +62,17 @@ def tick(conn, ingestion):
         if not acquired:
             return {'status': 'admission_busy'}
         with conn.cursor() as q:
-            q.execute('''SELECT EXISTS(SELECT 1 FROM control.stitching_job
-                         WHERE created_at >= %s::timestamptz
-                           AND status = ANY(%s)
-                           AND created_at < clock_timestamp()-interval '24 hours')''',
-                      (not_before,['QUEUED', *ACTIVE]))
+            # Queue age matters only once admission is eligible; active work
+            # remains monitored even if its ingestion/validation facts change.
+            q.execute('''SELECT EXISTS(SELECT 1 FROM control.stitching_job sj
+                         LEFT JOIN control.ingestion_batch ib ON ib.batch_id=sj.ingestion_batch_id
+                         LEFT JOIN quality.customer_validation_run vr ON vr.stitching_job_id=sj.job_id
+                         WHERE sj.created_at >= %s::timestamptz
+                           AND (sj.status = ANY(%s) OR (
+                               sj.status='QUEUED' AND ib.status='completed'
+                               AND vr.stitching_job_id IS NOT NULL))
+                           AND sj.created_at < clock_timestamp()-interval '24 hours')''',
+                      (not_before,list(ACTIVE)))
             overdue = q.fetchone()[0]
         conn.commit()
         if overdue:
