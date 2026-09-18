@@ -48,6 +48,8 @@ class ConnectorRuntimeStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
         config = _validate_config(project_config)
+        if not config.get('stitching_admission_function_arn'):
+            raise ValueError('connector runtime requires stitching_admission_function_arn; direct stitching dispatch is unsafe')
 
         key = kms.Key(
             self,
@@ -466,12 +468,18 @@ class ConnectorRuntimeStack(Stack):
             "ConnectorStateMachineRole",
             assumed_by=iam.ServicePrincipal("states.amazonaws.com"),
         )
+        admission_function = config.get("stitching_admission_function_arn")
         role.add_to_policy(
             iam.PolicyStatement(
                 actions=["ecs:RunTask"],
-                resources=[connector_task_definition_arn, stitcher_task_definition_arn],
+                resources=([connector_task_definition_arn] if admission_function else
+                           [connector_task_definition_arn, stitcher_task_definition_arn]),
             )
         )
+        if admission_function:
+            role.add_to_policy(iam.PolicyStatement(
+                actions=["lambda:InvokeFunction"], resources=[admission_function]
+            ))
         role.add_to_policy(
             iam.PolicyStatement(
                 actions=["ecs:DescribeTasks", "ecs:StopTask"],
@@ -706,6 +714,44 @@ class ConnectorRuntimeStack(Stack):
                 },
             },
         }
+        if admission_function:
+            # Queue waiting is durable and independent of the connector extract
+            # budget. Stay within the Standard workflow's one-year maximum.
+            definition["TimeoutSeconds"] = 604800
+            states = definition["States"]
+            for name in ('RunConnectorOperation', 'ExtractAndLoadConnectorDataset'):
+                states[name]['TimeoutSeconds'] = int(config.get('workflow_timeout_hours',6))*3600
+            states["RunImportedIdentityStitcher"] = {
+                "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": admission_function, "Payload": {
+                    "action": "stitching_job_status",
+                    "ingestion_batch_id.$": "$.ingestion_batch_id",
+                    "stitching_job_id.$": "$.stitching_job_id",
+                }},
+                "ResultPath": "$.stitching_result",
+                "Retry": [{"ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                           "IntervalSeconds": 10, "MaxAttempts": 6, "BackoffRate": 2}],
+                "Catch": catch_all, "Next": "CheckStitchingCompletion",
+            }
+            states["CheckStitchingCompletion"] = {
+                "Type": "Choice", "Choices": [
+                    {"Variable": "$.stitching_result.Payload.status", "StringEquals": "SUCCEEDED", "Next": "PrepareSuccessResult"},
+                    {"Variable": "$.stitching_result.Payload.status", "StringEquals": "FAILED", "Next": "PrepareStitchingFailure"},
+                    {"Variable": "$.stitching_result.Payload.status", "StringEquals": "BLOCKED", "Next": "PrepareStitchingFailure"},
+                    {"Variable": "$.stitching_result.Payload.overdue", "BooleanEquals": True, "Next": "PrepareStitchingOverdue"},
+                ], "Default": "WaitForStitchingAdmission",
+            }
+            states["WaitForStitchingAdmission"] = {
+                "Type": "Wait", "Seconds": 60, "Next": "RunImportedIdentityStitcher",
+            }
+            states["PrepareStitchingOverdue"] = {
+                "Type": "Pass", "Result": {"Error": "StitchingCompletionOverdueWorkRetained"},
+                "ResultPath": "$.error", "Next": "PrepareFailureResult",
+            }
+            states["PrepareStitchingFailure"] = {
+                "Type": "Pass", "Result": {"Error": "StitchingJobFailed"},
+                "ResultPath": "$.error", "Next": "PrepareFailureResult",
+            }
         state_machine_resource = sfn.CfnStateMachine(
             self,
             "ConnectorStateMachine",

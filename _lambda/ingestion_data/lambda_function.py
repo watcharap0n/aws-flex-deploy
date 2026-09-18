@@ -1203,15 +1203,17 @@ def _resolve_ecs_container_name(ecs: Any, task_definition: str) -> str:
     return str(essential[0]["name"])
 
 
-def _start_stitching_task(batch_id: str, job_id: str) -> str:
+def _stitching_task_request(batch_id: str, job_id: str) -> Dict[str, Any]:
     assign_public_ip = os.getenv("ECS_ASSIGN_PUBLIC_IP", "DISABLED").upper()
     if assign_public_ip not in {"ENABLED", "DISABLED"}:
         raise ValueError("ECS_ASSIGN_PUBLIC_IP must be ENABLED or DISABLED")
 
     ecs = boto3.client("ecs")
     task_definition = _required_environment("ECS_TASK_DEFINITION")
+    if not task_definition.rsplit(':', 1)[-1].isdigit():
+        raise ValueError('ECS_TASK_DEFINITION must pin a numeric revision')
     container_name = _resolve_ecs_container_name(ecs, task_definition)
-    response = ecs.run_task(
+    return dict(
         cluster=_required_environment("ECS_CLUSTER"),
         taskDefinition=task_definition,
         launchType="FARGATE",
@@ -1258,10 +1260,23 @@ def _start_stitching_task(batch_id: str, job_id: str) -> str:
         },
         enableECSManagedTags=True,
     )
+
+
+class StitchingDispatchRejected(RuntimeError):
+    """ECS returned a definitive zero-task response, not a lost response."""
+
+
+def _start_stitching_task(batch_id: str, job_id: str, *, request=None) -> str:
+    response = boto3.client("ecs").run_task(
+        **(request or _stitching_task_request(batch_id, job_id))
+    )
     failures = response.get("failures") or []
-    if failures:
-        raise RuntimeError(f"ECS RunTask failed: {failures}")
     tasks = response.get("tasks") or []
+    if failures and not tasks:
+        reasons = ','.join(sorted({str(f.get('reason','unknown')) for f in failures}))[:500]
+        raise StitchingDispatchRejected(f"ECS RunTask rejected: {reasons}")
+    if failures:
+        raise RuntimeError("ECS RunTask returned ambiguous mixed tasks/failures")
     if not tasks or not tasks[0].get("taskArn"):
         raise RuntimeError("ECS RunTask returned no task ARN")
     return str(tasks[0]["taskArn"])
@@ -1523,36 +1538,17 @@ def _dispatch_stitching(
             "task_arn": job["task_arn"],
         }
 
+    # The committed QUEUED job is the durable outbox. A scheduled admission
+    # reconciler launches it, including when this invocation dies after commit.
+    # Never occupy a Fargate worker merely to wait behind a full-staging writer.
     job_id = str(job["job_id"])
-    LOGGER.info(
-        "ecs_run_task_started batch_id=%s job_id=%s", batch_id, job_id
-    )
-    try:
-        task_arn = _start_stitching_task(str(batch_id), job_id)
-    except Exception as exc:
-        _mark_stitching_dispatch_failed(
-            connection, str(batch_id), job_id, exc
-        )
-        raise
-    # The task can move QUEUED -> WAITING/RUNNING before RunTask returns. The
-    # recorder preserves that later state. If this database write fails, leave
-    # the job retryable: the same ECS client token resolves to the same task.
-    _record_stitching_dispatch(
-        connection, str(batch_id), job_id, task_arn
-    )
-    LOGGER.info(
-        "ecs_run_task_submitted batch_id=%s job_id=%s task_arn=%s",
-        batch_id,
-        job_id,
-        task_arn,
-    )
-    result["stitching_task_arn"] = task_arn
+    result["stitching_task_arn"] = None
     result["stitching_job_id"] = job_id
     return {
-        "status": "submitted",
+        "status": "queued",
         "batch_id": batch_id,
         "job_id": job_id,
-        "task_arn": task_arn,
+        "task_arn": None,
     }
 
 
@@ -1716,6 +1712,20 @@ def _handle_ecs_task_state_change(
 
 
 def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
+    if event.get("action") in {"stitching_admission_tick", "stitching_job_status"}:
+        import sys
+        import stitching_admission
+        connection = _connect()
+        try:
+            if os.getenv('STITCHING_ADMISSION_ENABLED','false').lower() != 'true' and event['action']=='stitching_admission_tick':
+                return {'status':'admission_disabled'}
+            if event["action"] == "stitching_admission_tick":
+                return stitching_admission.tick(connection, sys.modules[__name__])
+            return stitching_admission.job_status(
+                connection, str(event["ingestion_batch_id"]), str(event["stitching_job_id"])
+            )
+        finally:
+            connection.close()
     print(json.dumps(event))
     if event.get("source") == "aws.ecs" and event.get(
         "detail-type"

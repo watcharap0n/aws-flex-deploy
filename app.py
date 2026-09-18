@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+from pathlib import Path
 import yaml
 import aws_cdk as cdk
 from cdk_stacks.lambda_stack import LambdaStack
@@ -64,10 +65,18 @@ if config.get('connector_runtime_stack'):
     connector_stack_config = config['connector_runtime_stack']
     if not connector_stack_config.get('stack_name'):
         raise AssertionError("connector_runtime_stack requires stack_name")
+    ingestion_config = next((entry['project_config'] for entry in lambda_stack_configs
+        if Path(entry['project_config'].get('code_from_asset', '')).resolve() == Path('_lambda/ingestion_data').resolve()), None)
+    connector_project_config = dict(connector_stack_config['project_config'])
+    if ingestion_config:
+        connector_project_config['stitching_admission_function_arn'] = (
+            f"arn:aws:lambda:{config['aws_region']}:{config['aws_account_id']}:"
+            f"function:{ingestion_config['lambda_function_name']}"
+        )
     ConnectorRuntimeStack(
         app,
         connector_stack_config['stack_name'],
-        project_config=connector_stack_config['project_config'],
+        project_config=connector_project_config,
         env=ENV,
         tags=tags,
     )

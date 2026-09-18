@@ -35,6 +35,7 @@ def _config(fast_worker_enabled=True):
                 f"arn:aws:iam::{account}:role/stitcher-execution",
             ],
         },
+        "stitching_admission_function_arn": f"arn:aws:lambda:{region}:{account}:function:ingestion",
         "landing_bucket_name": "connector-landing-bucket",
         "warehouse_secret_arn": (
             f"arn:aws:secretsmanager:{region}:{account}:secret:warehouse-AbCdEf"
@@ -134,10 +135,9 @@ def test_state_machine_runs_connector_then_stitcher_for_sync():
     rendered = str(template)
     assert "arn:aws:states:::ecs:runTask.sync" in rendered
     assert "task-definition/connector-worker:12" in rendered
-    assert "task-definition/identity-stitcher:8" in rendered
+    assert "task-definition/identity-stitcher:8" not in rendered
     assert "--operation-id" in rendered
-    assert "--batch-id" in rendered
-    assert "--job-id" in rendered
+    assert "stitching_job_status" in rendered
     assert "$.task_result" in rendered
 
     state_machine = next(
@@ -149,7 +149,6 @@ def test_state_machine_runs_connector_then_stitcher_for_sync():
     for state_name in (
         "RunConnectorOperation",
         "ExtractAndLoadConnectorDataset",
-        "RunImportedIdentityStitcher",
     ):
         state = states[state_name]
         assert state["Parameters"]["LaunchType"] == "FARGATE"
@@ -194,7 +193,6 @@ def test_state_machine_uses_fargate_spot_and_configured_ecs_retry():
     for state_name in (
         "RunConnectorOperation",
         "ExtractAndLoadConnectorDataset",
-        "RunImportedIdentityStitcher",
     ):
         state = states[state_name]
         assert state["Parameters"]["CapacityProviderStrategy"] == [

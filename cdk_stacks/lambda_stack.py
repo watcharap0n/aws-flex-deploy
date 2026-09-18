@@ -6,10 +6,12 @@ from aws_cdk import (
     aws_s3 as s3,
     aws_events as events,
     aws_events_targets as event_targets,
+    aws_cloudwatch as cloudwatch,
     Duration,
     Size,
 )
 import re
+from pathlib import Path
 from constructs import Construct
 
 class LambdaStack(Stack):
@@ -170,7 +172,7 @@ class LambdaStack(Stack):
         # =================================================================================================================
         lambda_kwargs = {
             "function_name": self.lambda_function_name,
-            "code": _lambda.Code.from_asset(self.code_from_asset),
+            "code": _lambda.Code.from_asset(self.code_from_asset, exclude=['**/__pycache__/**', '**/*.pyc', '**/.DS_Store']),
             "handler": self.function_handler,
             "runtime": self.lambda_runtime,
             "timeout": Duration.seconds(self.timeout_seconds),
@@ -212,6 +214,45 @@ class LambdaStack(Stack):
                 s3.EventType.OBJECT_CREATED,
                 notification,
                 s3.NotificationKeyFilter(prefix=trigger_prefix, suffix=trigger_suffix)
+            )
+
+        if Path(self.code_from_asset or '').resolve() == (Path(__file__).resolve().parents[1] / '_lambda/ingestion_data'):
+            # This asset uses a durable DB outbox; deploying it without its
+            # reconciler would strand all new uploads. Keep this invariant in IaC.
+            if not self.environments.get('STITCHING_ADMISSION_NOT_BEFORE'):
+                raise ValueError('Stitching admission requires explicit STITCHING_ADMISSION_NOT_BEFORE')
+            if self.environments.get('STITCHING_ADMISSION_ENABLED','false')=='true':
+                import os
+                # Activation must use the checked executor, not ordinary cdk deploy.
+                if os.environ.get('STITCHING_CHECKED_ACTIVATION') != '1':
+                    raise ValueError('Enabled admission requires the checked activation release executor')
+            project_config = {**project_config, 'stitching_admission_enabled': True}
+
+        if project_config.get('stitching_admission_enabled', False):
+            cluster_name = self.environments.get('ECS_CLUSTER')
+            if not cluster_name:
+                raise ValueError('Stitching admission requires ECS_CLUSTER')
+            cluster_arn = (cluster_name if cluster_name.startswith('arn:') else
+                           self.format_arn(service='ecs', resource='cluster', resource_name=cluster_name))
+            role.add_to_policy(iam.PolicyStatement(
+                actions=['ecs:ListTasks', 'ecs:DescribeTasks'], resources=['*'],
+                conditions={'ArnEquals': {'ecs:cluster': cluster_arn}},
+            ))
+            admission_rule = events.Rule(
+                self, 'StitchingAdmissionSchedule',
+                schedule=events.Schedule.rate(Duration.minutes(1)),
+            )
+            admission_rule.add_target(event_targets.LambdaFunction(
+                lambda_function,
+                event=events.RuleTargetInput.from_object({'action': 'stitching_admission_tick'}),
+                retry_attempts=2,
+            ))
+            cloudwatch.Alarm(
+                self, 'StitchingAdmissionErrors',
+                metric=lambda_function.metric_errors(period=Duration.minutes(5)),
+                threshold=1, evaluation_periods=1,
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+                alarm_description='Inspect ingestion/admission errors and control.stitching_admission; never kill the writer to clear backlog.',
             )
 
         # Optional: reconcile terminal ECS task events back into the Lambda
