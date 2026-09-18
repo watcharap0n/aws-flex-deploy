@@ -54,6 +54,21 @@ def ingestion():
     )
 
 
+@pytest.mark.parametrize("raw_status, expected", [
+    ("ใช้งาน", "ACTIVE"), ("ปิดใช้งาน", "INACTIVE"),
+    (" active ", "ACTIVE"), ("inactive", "INACTIVE"),
+    ("BLOCKED", "BLOCKED"), ("DELETED", "DELETED"), ("", "ACTIVE"),
+    ("SUSPENDED", "SUSPENDED"), (" suspended ", "SUSPENDED"),
+    ("UNRECOGNIZED", "UNRECOGNIZED"),
+])
+def test_ingestion_normalizes_customer_status(ingestion, raw_status, expected):
+    payload = f"source_customer_id,status\nstatus-regression,{raw_status}\n".encode()
+    customers, stats = ingestion.prepare_customers(payload)
+    assert stats["records_rejected"] == 0
+    assert customers[0]["status"] == expected
+    assert customers[0]["raw_payload"]["status"] == raw_status
+
+
 def _config(landing):
     return landing.Config(
         db_secret_id="unused",

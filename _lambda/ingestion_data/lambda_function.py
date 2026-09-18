@@ -261,7 +261,9 @@ def prepare_customers(
             "apple_id": direct_identifiers["apple_id"],
             "member_code": direct_identifiers["member_code"],
             "customer_type": _optional(row["customer_type"]),
-            "status": _optional(row["status"]) or "ACTIVE",
+            "status": {"ใช้งาน": "ACTIVE", "ปิดใช้งาน": "INACTIVE"}.get(
+                row["status"], _optional(row["status"].upper()) or "ACTIVE"
+            ),
             "language": _optional(row["language"]),
             "source": _optional(row["source"]),
             "source_system": _optional(row["source_system"]),
@@ -943,7 +945,12 @@ def _process_record(
                 )
                 VALUES (%s, %s, %s, %s, 'processing', %s, %s, %s, %s)
                 ON CONFLICT (source_system_id, object_name, checksum)
-                    DO NOTHING
+                    DO UPDATE SET status = 'processing',
+                                  completed_at = NULL,
+                                  updated_at = now()
+                    WHERE ingestion_batch.status = 'failed'
+                      AND ingestion_batch.metadata ? 'ingestion_error_code'
+                      AND ingestion_batch.landing_batch_id = EXCLUDED.landing_batch_id
                 RETURNING batch_id::text
                 """,
                 (
@@ -1005,115 +1012,140 @@ def _process_record(
                 }
 
             batch_id = inserted[0]
-            cursor.execute(
-                """
-                INSERT INTO control.stitching_job (
-                    ingestion_batch_id, attempt, status
+            failure = None
+            cursor.execute("SAVEPOINT ingestion_payload")
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO control.stitching_job (
+                        ingestion_batch_id, attempt, status
+                    )
+                    VALUES (%s, 1, 'QUEUED')
+                    RETURNING job_id::text
+                    """,
+                    (batch_id,),
                 )
-                VALUES (%s, 1, 'QUEUED')
-                RETURNING job_id::text
-                """,
-                (batch_id,),
-            )
-            stitching_job_id = str(cursor.fetchone()[0])
-            validation_run_id = _create_validation_run(
-                cursor,
-                landing_batch_id=landing_batch_id,
-                ingestion_batch_id=batch_id,
-                stitching_job_id=stitching_job_id,
-                attempt=1,
-            )
-            _log_stage("database_setup", stage_started)
-
-            stage_started = time.perf_counter()
-            _create_existing_source_snapshot(
-                cursor,
-                landing_batch_id=landing_batch_id,
-                source_system_id=source_system_id,
-            )
-            _log_stage("snapshot_existing_records", stage_started)
-
-            stage_started = time.perf_counter()
-            _upsert_customers(cursor, customers, batch_id, source_system_id)
-            _log_stage(
-                "upsert_customers",
-                stage_started,
-                records=len(customers),
-            )
-
-            stage_started = time.perf_counter()
-            _seed_validation_records(
-                cursor,
-                validation_run_id=validation_run_id,
-                landing_batch_id=landing_batch_id,
-                source_system_id=source_system_id,
-            )
-            _log_stage("seed_validation_records", stage_started)
-
-            stage_started = time.perf_counter()
-            _record_batch_members(
-                cursor,
-                batch_id,
-                source_system_id,
-                len(customers),
-            )
-            _log_stage(
-                "record_batch_members",
-                stage_started,
-                records=len(customers),
-            )
-            cursor.execute(
-                """
-                UPDATE quality.customer_validation_run
-                SET selected_record_count = %s,
-                    existing_source_record_count = (
-                        SELECT count(*)
-                        FROM quality.customer_validation_record
-                        WHERE validation_run_id = %s
-                          AND existing_source_record
-                          AND selected_for_canonical
-                    ),
-                    updated_at = now()
-                WHERE validation_run_id = %s
-                  AND run_status = 'PENDING'
-                """,
-                (
-                    len(customers),
-                    validation_run_id,
-                    validation_run_id,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError(
-                    f"Unable to initialize validation run {validation_run_id}"
+                stitching_job_id = str(cursor.fetchone()[0])
+                validation_run_id = _create_validation_run(
+                    cursor,
+                    landing_batch_id=landing_batch_id,
+                    ingestion_batch_id=batch_id,
+                    stitching_job_id=stitching_job_id,
+                    attempt=1,
                 )
-            metadata = {
-                "bucket": bucket,
-                "event_time": record.get("eventTime"),
-                "duplicate_rows": stats["duplicate_rows"],
-                "landing_batch_id": landing_batch_id,
-                "stitching_job_id": stitching_job_id,
-                "validation_run_id": validation_run_id,
-            }
-            cursor.execute(
-                """
-                UPDATE control.ingestion_batch
-                SET status           = 'completed',
-                    completed_at     = now(),
-                    records_received = %s,
-                    records_loaded   = %s,
-                    records_rejected = %s,
-                    metadata         = %s
-                WHERE batch_id = %s
-                """,
-                (
-                    stats["records_received"],
-                    len(customers),
-                    stats["records_rejected"],
-                    Json(metadata),
+                _log_stage("database_setup", stage_started)
+
+                stage_started = time.perf_counter()
+                _create_existing_source_snapshot(
+                    cursor,
+                    landing_batch_id=landing_batch_id,
+                    source_system_id=source_system_id,
+                )
+                _log_stage("snapshot_existing_records", stage_started)
+
+                stage_started = time.perf_counter()
+                _upsert_customers(cursor, customers, batch_id, source_system_id)
+                _log_stage(
+                    "upsert_customers",
+                    stage_started,
+                    records=len(customers),
+                )
+
+                stage_started = time.perf_counter()
+                _seed_validation_records(
+                    cursor,
+                    validation_run_id=validation_run_id,
+                    landing_batch_id=landing_batch_id,
+                    source_system_id=source_system_id,
+                )
+                _log_stage("seed_validation_records", stage_started)
+
+                stage_started = time.perf_counter()
+                _record_batch_members(
+                    cursor,
                     batch_id,
-                ),
-            )
+                    source_system_id,
+                    len(customers),
+                )
+                _log_stage(
+                    "record_batch_members",
+                    stage_started,
+                    records=len(customers),
+                )
+                cursor.execute(
+                    """
+                    UPDATE quality.customer_validation_run
+                    SET selected_record_count = %s,
+                        existing_source_record_count = (
+                            SELECT count(*)
+                            FROM quality.customer_validation_record
+                            WHERE validation_run_id = %s
+                              AND existing_source_record
+                              AND selected_for_canonical
+                        ),
+                        updated_at = now()
+                    WHERE validation_run_id = %s
+                      AND run_status = 'PENDING'
+                    """,
+                    (
+                        len(customers),
+                        validation_run_id,
+                        validation_run_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"Unable to initialize validation run {validation_run_id}"
+                    )
+                metadata = {
+                    "bucket": bucket,
+                    "event_time": record.get("eventTime"),
+                    "duplicate_rows": stats["duplicate_rows"],
+                    "landing_batch_id": landing_batch_id,
+                    "stitching_job_id": stitching_job_id,
+                    "validation_run_id": validation_run_id,
+                }
+                cursor.execute(
+                    """
+                    UPDATE control.ingestion_batch
+                    SET status           = 'completed',
+                        completed_at     = now(),
+                        records_received = %s,
+                        records_loaded   = %s,
+                        records_rejected = %s,
+                        metadata         = %s
+                    WHERE batch_id = %s
+                    """,
+                    (
+                        stats["records_received"],
+                        len(customers),
+                        stats["records_rejected"],
+                        Json(metadata),
+                        batch_id,
+                    ),
+                )
+            except Exception as exc:
+                # Roll back customer/snapshot/job writes, not the batch identity.
+                # Re-raise AFTER committing failure so S3/Lambda still retries.
+                cursor.execute("ROLLBACK TO SAVEPOINT ingestion_payload")
+                cursor.execute(
+                    """
+                    UPDATE control.ingestion_batch
+                    SET status = 'failed',
+                        completed_at = now(),
+                        updated_at = now(),
+                        metadata = COALESCE(metadata, '{}'::jsonb) || %s
+                    WHERE batch_id = %s
+                    """,
+                    (Json({"ingestion_error_code": type(exc).__name__}), batch_id),
+                )
+                failure = exc
+    if failure is not None:
+        # Database exception details can contain an entire customer row.
+        raise RuntimeError(
+            f"Customer ingestion failed for batch {batch_id}: "
+            f"{type(failure).__name__}"
+        ) from None
     _log_stage(
         "database_transaction",
         transaction_started,
