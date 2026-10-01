@@ -1,0 +1,17 @@
+{
+  "kind": "real-migration024-025-cutover-worker-local-synthetic",
+  "users": 100000,
+  "legacy_rows": 436623,
+  "seed_and_capture_seconds": 26.9111712090089,
+  "transfer_wall_seconds": 63.93633425000007,
+  "timings": {
+    "load_seconds": 20.730664499977138,
+    "verify_publish_seconds": 42.831971958017675,
+    "total_seconds": 63.56263645799481
+  },
+  "overlay_full_read_seconds": 15.159471958002541,
+  "source_sha256": "7574e8fe46efe415f916946fc2ed02d250a8957eb79936397774d510555d3d93",
+  "replay_seconds": 45.882660584000405,
+  "physical_rows": 100000,
+  "marker_rows": 1
+}

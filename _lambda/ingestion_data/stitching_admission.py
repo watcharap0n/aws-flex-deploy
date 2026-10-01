@@ -8,12 +8,16 @@ publication. Neither elapsed contention nor a duplicate event fails a job.
 from datetime import datetime, timezone
 import logging
 import os
+import sys
+import time
 
 from botocore.exceptions import ClientError
 from psycopg2.extras import Json, RealDictCursor
 
 LOGGER = logging.getLogger(__name__)
-ADMISSION_LOCK = 7413220180
+# Only admission launchers share this key. Publication uses 7413220180 and
+# may hold it across ClickHouse I/O; it must not stall independent dispatch.
+ADMISSION_LOCK = 7413220181
 WRITER_LOCK = 7413220179
 ACTIVE = ('SUBMITTED', 'WAITING_FOR_LOCK', 'VALIDATING', 'RUNNING')
 
@@ -46,6 +50,20 @@ def _active_tasks(ecs, cluster):
 
 def tick(conn, ingestion):
     """One bounded admission pass. Never wait for or kill an existing writer."""
+    started = time.monotonic()
+    stage = 'admission_lock'
+    outcome = None
+    job_age = None
+    overdue = False
+
+    def report(result, *, created_at=None):
+        nonlocal outcome, job_age
+        outcome = result['status']
+        if created_at is not None:
+            # created_at is transaction-time enqueue, not proof of eligibility.
+            job_age = max(0, round((datetime.now(timezone.utc)-created_at).total_seconds()))
+        return result
+
     acquired = False
     writer = False
     ecs = ingestion.boto3.client('ecs')
@@ -60,7 +78,8 @@ def tick(conn, ingestion):
             acquired = q.fetchone()[0]
         conn.commit()
         if not acquired:
-            return {'status': 'admission_busy'}
+            return report({'status': 'admission_busy'})
+        stage = 'overdue_check'
         with conn.cursor() as q:
             # Queue age matters only once admission is eligible; active work
             # remains monitored even if its ingestion/validation facts change.
@@ -79,12 +98,14 @@ def tick(conn, ingestion):
             # Alarm without mutating/abandoning the actual work or writer.
             LOGGER.error('stitching_admission_overdue work_retained=true')
         # Check the actual database writer before all ECS/API work.
+        stage = 'writer_lock'
         with conn.cursor() as q:
             q.execute('SELECT pg_try_advisory_lock(%s)', (WRITER_LOCK,))
             writer = q.fetchone()[0]
         conn.commit()
         if not writer:
-            return {'status': 'waiting_for_writer'}
+            return report({'status': 'waiting_for_writer'})
+        stage = 'task_inventory'
         tasks = _active_tasks(ecs, cluster)
         if tasks:
             # Repair the commit-after-RunTask gap without ever launching twice.
@@ -99,9 +120,10 @@ def tick(conn, ingestion):
                     ingestion._record_stitching_dispatch(conn, orphan[1], orphan[0], task['taskArn'])
                     with conn, conn.cursor() as q:
                         q.execute("UPDATE control.stitching_admission SET state='LAUNCHED',task_arn=%s,updated_at=clock_timestamp() WHERE job_id=%s",(task['taskArn'],orphan[0]))
-            return {'status': 'active_task'}
+            return report({'status': 'active_task'})
 
         # Reconcile uncertain launches including tasks that already stopped.
+        stage = 'reconciliation'
         with conn.cursor(cursor_factory=RealDictCursor) as q:
             q.execute("SELECT job_id::text FROM control.stitching_admission WHERE state='PREPARED' AND dispatch_attempts>0")
             uncertain = q.fetchall()
@@ -143,7 +165,7 @@ def tick(conn, ingestion):
                 raise RuntimeError('Tracked ECS task missing; operator reconciliation required')
             task = response['tasks'][0]
             if task['lastStatus'] != 'STOPPED':
-                return {'status': 'active_task', 'job_id': job['job_id']}
+                return report({'status': 'active_task', 'job_id': job['job_id']})
             ingestion._handle_ecs_task_state_change({'detail': task}, conn)
 
         # Defensive recovery for a legacy/direct caller racing admission. Only
@@ -175,8 +197,9 @@ def tick(conn, ingestion):
             with conn, conn.cursor() as q:
                 q.execute('UPDATE control.stitching_admission SET retry_job_id=%s,updated_at=clock_timestamp() WHERE job_id=%s', (replacement['job_id'],retry['job_id']))
 
+        stage = 'queue'
         with conn.cursor(cursor_factory=RealDictCursor) as q:
-            q.execute('''SELECT sj.job_id::text, sj.ingestion_batch_id::text
+            q.execute('''SELECT sj.job_id::text, sj.ingestion_batch_id::text, sj.created_at
                          FROM control.stitching_job sj
                          JOIN control.ingestion_batch ib ON ib.batch_id=sj.ingestion_batch_id
                          JOIN quality.customer_validation_run vr ON vr.stitching_job_id=sj.job_id
@@ -186,7 +209,7 @@ def tick(conn, ingestion):
             job = q.fetchone()
         conn.commit()
         if not job:
-            return {'status': 'idle'}
+            return report({'status': 'idle'})
         job_id, batch = job['job_id'], job['ingestion_batch_id']
         # Persist the exact request before network I/O. It is never reconstructed
         # after a crash or a configuration deployment (ECS clientToken contract).
@@ -206,7 +229,7 @@ def tick(conn, ingestion):
         if intent['state'] == 'BLOCKED':
             raise RuntimeError('Stitching admission blocked; inspect durable intent')
         if intent['next_attempt_at'] > now:
-            return {'status': 'retry_pending', 'job_id': job_id}
+            return report({'status': 'retry_pending', 'job_id': job_id})
         if intent['dispatch_attempts'] >= 20 or (now-intent['prepared_at']).total_seconds() > 3600:
             # Do not replay an uncertain ECS launch after token retention expires.
             with conn, conn.cursor() as q:
@@ -216,12 +239,14 @@ def tick(conn, ingestion):
             q.execute('''UPDATE control.stitching_admission SET dispatch_attempts=dispatch_attempts+1,
                          next_attempt_at=clock_timestamp()+interval '60 seconds', updated_at=clock_timestamp()
                          WHERE job_id=%s''', (job_id,))
+        stage = 'dispatch'
         try:
             task_arn = ingestion._start_stitching_task(batch, job_id, request=intent['request'])
             ingestion._record_stitching_dispatch(conn, batch, job_id, task_arn)
             with conn, conn.cursor() as q:
                 q.execute("UPDATE control.stitching_admission SET state='LAUNCHED',task_arn=%s,last_error=NULL,updated_at=clock_timestamp() WHERE job_id=%s",(task_arn,job_id))
-            return {'status': 'submitted', 'job_id': job_id, 'task_arn': task_arn}
+            return report({'status': 'submitted', 'job_id': job_id, 'task_arn': task_arn},
+                          created_at=job.get('created_at'))
         except Exception as exc:
             conn.rollback()
             code = exc.response.get('Error', {}).get('Code') if isinstance(exc, ClientError) else type(exc).__name__
@@ -235,17 +260,34 @@ def tick(conn, ingestion):
                 ingestion._mark_stitching_dispatch_failed(conn, batch, job_id, RuntimeError('ECS RunTask rejected: '+str(code)))
             with conn, conn.cursor() as q:
                 q.execute('UPDATE control.stitching_admission SET last_error=%s,updated_at=clock_timestamp() WHERE job_id=%s',(code,job_id))
+            if isinstance(exc, ingestion.StitchingDispatchRetryable):
+                # ECS confirmed zero tasks. Refresh only the uncertainty budget;
+                # retain the pinned request/token and 60-second retry delay.
+                with conn, conn.cursor() as q:
+                    q.execute('''UPDATE control.stitching_admission
+                                 SET dispatch_attempts=0, prepared_at=clock_timestamp(),
+                                     next_attempt_at=clock_timestamp()+interval '60 seconds',
+                                     updated_at=clock_timestamp() WHERE job_id=%s''', (job_id,))
+                return report({'status': 'retry_pending', 'job_id': job_id})
             raise
     finally:
-        conn.rollback()
-        with conn.cursor() as q:
-            if writer:
-                q.execute('SELECT pg_advisory_unlock(%s)', (WRITER_LOCK,))
-            if acquired:
-                q.execute('SELECT pg_advisory_unlock(%s)', (ADMISSION_LOCK,))
-        conn.commit()
-        if acquired and locals().get('overdue'):
-            raise RuntimeError('Stitching completion overdue; work retained and writer untouched')
+        try:
+            conn.rollback()
+            with conn.cursor() as q:
+                if writer:
+                    q.execute('SELECT pg_advisory_unlock(%s)', (WRITER_LOCK,))
+                if acquired:
+                    q.execute('SELECT pg_advisory_unlock(%s)', (ADMISSION_LOCK,))
+            conn.commit()
+            if acquired and overdue:
+                raise RuntimeError('Stitching completion overdue; work retained and writer untouched')
+        finally:
+            fields = [f'status={"error" if sys.exc_info()[0] else outcome or "error"}',
+                      f'stage={stage}',
+                      f'admission_elapsed_ms={round((time.monotonic()-started)*1000)}']
+            if job_age is not None:
+                fields.append(f'job_age_seconds={job_age}')
+            LOGGER.info('stitching_admission_tick %s', ' '.join(fields))
 
 
 def job_status(conn, batch_id, job_id):

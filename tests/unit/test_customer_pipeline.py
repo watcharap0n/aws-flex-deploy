@@ -59,7 +59,7 @@ def ingestion():
     (" active ", "ACTIVE"), ("inactive", "INACTIVE"),
     ("BLOCKED", "BLOCKED"), ("DELETED", "DELETED"), ("", "ACTIVE"),
     ("SUSPENDED", "SUSPENDED"), (" suspended ", "SUSPENDED"),
-    ("UNRECOGNIZED", "UNRECOGNIZED"),
+    ("PENDING", "PENDING"),
 ])
 def test_ingestion_normalizes_customer_status(ingestion, raw_status, expected):
     payload = f"source_customer_id,status\nstatus-regression,{raw_status}\n".encode()
@@ -67,6 +67,17 @@ def test_ingestion_normalizes_customer_status(ingestion, raw_status, expected):
     assert stats["records_rejected"] == 0
     assert customers[0]["status"] == expected
     assert customers[0]["raw_payload"]["status"] == raw_status
+
+
+@pytest.mark.parametrize('age,status', [('-1','ACTIVE'), ('18','UNRECOGNIZED'),
+                                         ('-999','UNKNOWN')])
+def test_ingestion_rejects_rows_that_violate_customer_checks(ingestion, age, status):
+    payload = (f'source_customer_id,age,status\ninvalid,{age},{status}\n'
+               'valid,18,SUSPENDED\n').encode()
+    customers, stats = ingestion.prepare_customers(payload)
+    assert [customer['source_customer_id'] for customer in customers] == ['valid']
+    assert stats == {'records_received': 2, 'records_rejected': 1,
+                     'duplicate_rows': 0}
 
 
 def _config(landing):
@@ -805,6 +816,9 @@ def test_ingestion_seeds_arrival_facts_before_customer_upsert(
         def read(self):
             return b"source_customer_id,first_name\ncrm-1,Ada\n"
 
+        def close(self):
+            pass
+
     class S3:
         def get_object(self, **kwargs):
             assert kwargs["IfMatch"] == "etag-1"
@@ -932,7 +946,7 @@ def test_validation_record_seed_keeps_row_outcomes_without_copying_pii(
     assert "raw_payload" not in ranked_sql
     assert "validation_errors" not in ranked_sql
     assert "JOIN raw.customer_landing_source AS source" in cursor.sql
-    assert "LEFT JOIN raw.customer AS customer" in cursor.sql
+    assert "LEFT JOIN raw.customer_current AS customer" in cursor.sql
     assert "existing_source_record" in insert_columns
     assert "ORDER BY ranked.source_row_number" not in cursor.sql
 

@@ -21,13 +21,24 @@ Optional environment variables:
     INPUT_PREFIX          default: data_sources/
     OUTPUT_ROOT_PREFIX    default: raw/
     OUTPUT_BUCKET         default: event/source bucket
-    UPSERT_PAGE_SIZE      default: 1000
+    UPSERT_PAGE_SIZE      legacy compatibility setting (COPY no longer pages)
+    LANDING_MAX_PARSE_BYTES default: 67108864; non-CSV whole-frame safety cap
+    LANDING_MAX_CSV_BYTES default: 1073741824; sized worker CSV cap
+    LANDING_MAX_XLSX_EXPANDED_BYTES default: 268435456
+
+    Production spooled CSV evidence uses a bounded pandas text parser: all cells
+    remain source text (including numeric-looking and empty values). This is an
+    explicit CSV-only contract change from whole-file pandas numeric inference;
+    the small parse_csv_evidence compatibility API remains unchanged. Source
+    download, evidence SQLite store and downstream COPY are disk-backed. Budget
+    scratch storage for source plus evidence and SQLite indexes on sized workers.
 """
 
 from __future__ import annotations
 
 import base64
 import csv
+import uuid
 import hashlib
 import io
 import json
@@ -47,7 +58,21 @@ import boto3
 import pandas as pd
 import psycopg2
 from botocore.exceptions import ClientError
-from psycopg2.extras import Json, execute_values
+from psycopg2.extras import Json
+
+# Loaded lazily by file as well as by the Lambda import path (ECS/test callers).
+def _bulk_helpers():
+    import importlib.util
+    from pathlib import Path
+    import sys
+    name = "_customer_landing_bulk"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("landing_bulk.py"))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
 
 LOGGER = logging.getLogger()
 LOGGER.setLevel(logging.INFO)
@@ -55,6 +80,7 @@ LOGGER.setLevel(logging.INFO)
 DEFAULT_INPUT_PREFIX = "data_sources/"
 DEFAULT_OUTPUT_ROOT_PREFIX = "raw/"
 SUPPORTED_FILE_FORMATS = {"xlsx", "csv", "json"}
+DEFAULT_MAX_CSV_BYTES = 1024 ** 3  # source + SQLite evidence/index need scratch space
 SOURCE_CODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 BATCH_REF_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 
@@ -180,15 +206,24 @@ class SourceObject:
     source_type: str
     file_format: str
     event_version_id: str | None
+    event_etag: str | None = None
 
 
 @dataclass(frozen=True)
 class DownloadedObject:
-    content: bytes
+    content: Any  # bytes for legacy callers, seekable binary spool in production
     version_id: str | None
     etag: str | None
     content_length: int
     content_sha256: str
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        close = getattr(self.content, "close", None)
+        if close:
+            close()
 
 
 @dataclass(frozen=True)
@@ -203,11 +238,23 @@ class EvidenceRow:
 class ParsedSourceFile:
     sheet_name: str | None
     column_names: list[str]
-    rows: list[EvidenceRow]
+    rows: Any  # list for compatibility or reiterable disk-backed EvidenceStore
     file_status: str
     file_error: str | None
     blank_key_rows: int
     duplicate_key_rows: int
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        close = getattr(self.rows, "close", None)
+        if close:
+            close()
+
+
+class SourceCapacityError(RuntimeError):
+    """Retry on a larger worker; do not classify capacity as invalid data."""
 
 
 class SourceConflictError(ValueError):
@@ -312,6 +359,7 @@ def _source_from_record(
         source_type=source_type,
         file_format=file_format,
         event_version_id=object_data.get("versionId"),
+        event_etag=object_data.get("eTag"),
     )
 
 
@@ -320,19 +368,45 @@ def _download_object(s3_client: Any, source: SourceObject) -> DownloadedObject:
     if source.event_version_id:
         request["VersionId"] = source.event_version_id
 
+    if source.event_etag:
+        request["IfMatch"] = source.event_etag
     response = s3_client.get_object(**request)
-    content = response["Body"].read()
-    etag = response.get("ETag")
-    if isinstance(etag, str):
-        etag = etag.strip('"')
-
-    return DownloadedObject(
-        content=content,
-        version_id=response.get("VersionId") or source.event_version_id,
-        etag=etag,
-        content_length=int(response.get("ContentLength", len(content))),
-        content_sha256=hashlib.sha256(content).hexdigest(),
-    )
+    import tempfile
+    content = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    digest = hashlib.sha256()
+    size = 0
+    body = response["Body"]
+    try:
+        parse_cap = int(os.getenv("LANDING_MAX_PARSE_BYTES", str(64 * 1024 ** 2)))
+        max_bytes = (int(os.getenv("LANDING_MAX_CSV_BYTES", str(DEFAULT_MAX_CSV_BYTES)))
+                     if source.file_format == "csv" else parse_cap)
+        if int(response.get("ContentLength", 0)) > max_bytes:
+            raise SourceCapacityError("source exceeds configured download limit; route to sized worker")
+        while True:
+            chunk = body.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                raise SourceCapacityError("source exceeds configured download limit")
+            content.write(chunk)
+            digest.update(chunk)
+        if response.get("ContentLength") is not None and int(response["ContentLength"]) != size:
+            raise ValueError("S3 object length mismatch")
+        etag = response.get("ETag")
+        if isinstance(etag, str):
+            etag = etag.strip('"')
+        if source.event_etag and source.event_etag.strip('"') != etag:
+            raise SourceConflictError("Downloaded ETag does not match source event")
+        if source.event_version_id and response.get("VersionId") != source.event_version_id:
+            raise SourceConflictError("Downloaded VersionId does not match source event")
+        content.seek(0)
+        return DownloadedObject(content, response.get("VersionId"), etag, size, digest.hexdigest())
+    except BaseException:
+        content.close()
+        raise
+    finally:
+        body.close()
 
 
 def _is_missing(value: Any) -> bool:
@@ -420,7 +494,7 @@ def _is_identifier_header(value: Any) -> bool:
             normalised in explicit
             or "code" in collapsed
             or collapsed.endswith(("id", "uuid", "phone", "postcode"))
-            or collapsed == "contactnumber"
+            or collapsed in {"contactnumber", "phonenumber"}
     )
 
 
@@ -430,10 +504,11 @@ def _frame_to_evidence(
         *,
         sheet_name: str | None,
         row_number_start: int,
+        spool_rows: bool = False,
 ) -> ParsedSourceFile:
     """Convert a tabular source into the common evidence representation."""
     required_matches = _matching_columns(frame.columns, required_key)
-    frame = frame.copy()
+    frame = frame.copy(deep=False)
     frame.columns = _unique_headers(frame.columns)
     clean_key_matches = _matching_columns(frame.columns, required_key)
     key_column = clean_key_matches[0] if clean_key_matches else None
@@ -445,6 +520,24 @@ def _frame_to_evidence(
         file_errors.append(f"ambiguous_required_column:{required_key}")
     if frame.empty:
         file_errors.append("no_data_rows")
+
+    if spool_rows:
+        store = _bulk_helpers().EvidenceStore(EvidenceRow, required_key, key_column is not None)
+        try:
+            columns = list(frame.columns)
+            for row_number, values in enumerate(frame.itertuples(index=False, name=None), start=row_number_start):
+                payload = {column: _json_safe(value) for column, value in zip(columns, values)}
+                key = _identifier_text(payload.get(key_column)) if key_column else None
+                store.append(EvidenceRow(row_number, key, payload, None))
+            store.finish()
+            status = "INVALID" if file_errors else (
+                "INGESTED_WITH_WARNINGS" if store.blank_count or store.duplicate_count else "INGESTED")
+            return ParsedSourceFile(sheet_name, columns, store, status,
+                                    ";".join(file_errors) or None,
+                                    store.blank_count, store.duplicate_count)
+        except BaseException:
+            store.close()
+            raise
 
     payloads: list[dict[str, Any]] = []
     source_keys: list[str | None] = []
@@ -506,7 +599,7 @@ def _frame_to_evidence(
     )
 
 
-def parse_excel_evidence(content: bytes, required_key: str) -> ParsedSourceFile:
+def parse_excel_evidence(content: bytes, required_key: str, *, spool_rows: bool = False) -> ParsedSourceFile:
     """Auto-detect the worksheet and preserve identifiers as text."""
     excel = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
     if not excel.sheet_names:
@@ -543,10 +636,11 @@ def parse_excel_evidence(content: bytes, required_key: str) -> ParsedSourceFile:
         required_key,
         sheet_name=selected_sheet,
         row_number_start=2,
+        spool_rows=spool_rows,
     )
 
 
-def parse_csv_evidence(content: bytes, required_key: str) -> ParsedSourceFile:
+def parse_csv_evidence(content: bytes, required_key: str, *, spool_rows: bool = False) -> ParsedSourceFile:
     """Read a UTF-8 CSV while preserving identifier columns as text."""
     buffer = io.BytesIO(content)
     try:
@@ -577,10 +671,60 @@ def parse_csv_evidence(content: bytes, required_key: str) -> ParsedSourceFile:
         required_key,
         sheet_name=None,
         row_number_start=2,
+        spool_rows=spool_rows,
     )
 
 
-def parse_json_evidence(content: bytes, required_key: str) -> ParsedSourceFile:
+def _parse_csv_evidence_bounded(content: Any, required_key: str) -> ParsedSourceFile:
+    """CSV evidence contract: every non-missing cell is source text, not inferred.
+
+    pandas' default low_memory parser may infer each internal token block then
+    reconcile dtypes, so chunk-local inference cannot reproduce whole-file
+    payloads. Empty fields, including missing trailing cells, remain empty strings.
+    """
+    if isinstance(content, bytes):
+        content = io.BytesIO(content)
+    content.seek(0)
+    try:
+        headers = list(pd.read_csv(content, nrows=0, encoding="utf-8-sig",
+                                   keep_default_na=False).columns)
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError("CSV file is empty or contains no header") from exc
+    required_matches = _matching_columns(headers, required_key)
+    columns = _unique_headers(headers)
+    clean_key_matches = _matching_columns(columns, required_key)
+    key_column = clean_key_matches[0] if clean_key_matches else None
+    file_errors = []
+    if not required_matches:
+        file_errors.append(f"missing_required_column:{required_key}")
+    elif len(required_matches) > 1:
+        file_errors.append(f"ambiguous_required_column:{required_key}")
+    store = _bulk_helpers().EvidenceStore(EvidenceRow, required_key, key_column is not None)
+    try:
+        content.seek(0)
+        chunks = pd.read_csv(content, encoding="utf-8-sig", keep_default_na=False,
+                             dtype=str, chunksize=1024)
+        row_number = 2
+        for chunk in chunks:
+            for values in chunk.itertuples(index=False, name=None):
+                payload = {column: value if isinstance(value, str) else _json_safe(value)
+                           for column, value in zip(columns, values)}
+                key = _identifier_text(payload.get(key_column)) if key_column else None
+                store.append(EvidenceRow(row_number, key, payload, None))
+                row_number += 1
+        store.finish()
+        if not store.count:
+            file_errors.append("no_data_rows")
+        status = "INVALID" if file_errors else (
+            "INGESTED_WITH_WARNINGS" if store.blank_count or store.duplicate_count else "INGESTED")
+        return ParsedSourceFile(None, columns, store, status, ";".join(file_errors) or None,
+                                store.blank_count, store.duplicate_count)
+    except BaseException:
+        store.close()
+        raise
+
+
+def parse_json_evidence(content: bytes, required_key: str, *, spool_rows: bool = False) -> ParsedSourceFile:
     """Read a JSON array, one object, or an object containing records/data."""
     try:
         decoded = content.decode("utf-8-sig")
@@ -612,12 +756,13 @@ def parse_json_evidence(content: bytes, required_key: str) -> ParsedSourceFile:
     if any(not isinstance(record, Mapping) for record in records):
         raise ValueError("Every JSON record must be an object")
 
-    frame = pd.DataFrame([dict(record) for record in records])
+    frame = pd.DataFrame(records, dtype=object)
     return _frame_to_evidence(
         frame,
         required_key,
         sheet_name=None,
         row_number_start=1,
+        spool_rows=spool_rows,
     )
 
 
@@ -636,6 +781,49 @@ def parse_source_evidence(
     except KeyError as exc:
         raise ValueError(f"Unsupported source file format: {file_format}") from exc
     return parser(content, required_key)
+
+
+def parse_source_evidence_spooled(content: Any, file_format: str, required_key: str) -> ParsedSourceFile:
+    """Disk-backed evidence; CSV cells use explicit text semantics, not inference.
+
+    Non-CSV parsers retain their whole-frame safety cap and previous semantics.
+    """
+    if file_format == "csv":
+        size = len(content) if isinstance(content, bytes) else None
+        if size is None:
+            content.seek(0, 2)
+            size = content.tell()
+            content.seek(0)
+        parse_cap = int(os.getenv("LANDING_MAX_PARSE_BYTES", str(64 * 1024 ** 2)))
+        if size <= parse_cap:
+            if not isinstance(content, bytes):
+                content = content.read()
+            return parse_csv_evidence(content, required_key, spool_rows=True)
+        csv_cap = int(os.getenv("LANDING_MAX_CSV_BYTES", str(DEFAULT_MAX_CSV_BYTES)))
+        if size > csv_cap:
+            raise SourceCapacityError("source exceeds LANDING_MAX_CSV_BYTES")
+        return _parse_csv_evidence_bounded(content, required_key)
+    size = len(content) if isinstance(content, bytes) else None
+    if size is None:
+        content.seek(0, 2)
+        size = content.tell()
+        content.seek(0)
+    max_bytes = int(os.getenv("LANDING_MAX_PARSE_BYTES", str(64 * 1024 * 1024)))
+    if size > max_bytes:
+        raise SourceCapacityError("source exceeds LANDING_MAX_PARSE_BYTES; use a sized worker")
+    if not isinstance(content, bytes):
+        content = content.read()
+    if file_format == "xlsx":
+        # Compressed XLSX size does not bound its decoded frame/shared strings.
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(content)) as workbook:
+            expanded = sum(info.file_size for info in workbook.infolist())
+        if expanded > int(os.getenv("LANDING_MAX_XLSX_EXPANDED_BYTES", str(256 * 1024 * 1024))):
+            raise SourceCapacityError("workbook exceeds LANDING_MAX_XLSX_EXPANDED_BYTES")
+    parsers = {"csv": parse_csv_evidence, "json": parse_json_evidence, "xlsx": parse_excel_evidence}
+    if file_format not in parsers:
+        raise ValueError(f"Unsupported source file format: {file_format}")
+    return parsers[file_format](content, required_key, spool_rows=True)
 
 
 def _get_secret(secret_id: str) -> dict[str, Any]:
@@ -725,6 +913,7 @@ def _register_file(
         batch_id: str,
         source: SourceObject,
         downloaded: DownloadedObject,
+        *, resume_processing: bool = False,
 ) -> tuple[str, str]:
     """Return (file_id, action), where action is process/processed/in_progress."""
     cursor.execute(
@@ -756,7 +945,7 @@ def _register_file(
             )
         if old_status in TERMINAL_FILE_STATUSES:
             return str(file_id), "processed"
-        if old_status == "PROCESSING" and not processing_is_stale:
+        if old_status == "PROCESSING" and not processing_is_stale and not resume_processing:
             return str(file_id), "in_progress"
 
         cursor.execute(
@@ -808,53 +997,24 @@ def _replace_evidence_rows(
         source_type: str,
         batch_id: str,
         file_id: str,
-        rows: Sequence[EvidenceRow],
+        rows: Iterable[EvidenceRow],
         page_size: int,
 ) -> int:
+    # File replacement is atomic with completion in the caller's transaction.
+    # The parser guarantees unique row numbers; retain all duplicate customer
+    # keys and invalid rows. Defaults, FK and unique constraints remain enabled.
     source_config = SOURCE_CONFIG[source_type]
     table = source_config["table"]
     key_column = source_config["key_column"]
-
     cursor.execute(f"DELETE FROM {table} WHERE file_id = %s", (file_id,))
-    if not rows:
-        return 0
-
-    sql = f"""
-        INSERT INTO {table} (
-            batch_id,
-            file_id,
-            source_row_number,
-            {key_column},
-            raw_payload,
-            validation_errors
-        ) VALUES %s
-        ON CONFLICT (file_id, source_row_number) DO UPDATE SET
-            batch_id = EXCLUDED.batch_id,
-            {key_column} = EXCLUDED.{key_column},
-            raw_payload = EXCLUDED.raw_payload,
-            validation_errors = EXCLUDED.validation_errors,
-            ingested_at = now()
-    """
-    values = [
-        (
-            batch_id,
-            file_id,
-            row.source_row_number,
-            row.source_key,
-            Json(row.raw_payload),
-            Json(row.validation_errors) if row.validation_errors else None,
-        )
-        for row in rows
-    ]
-    for start in range(0, len(values), page_size):
-        execute_values(
-            cursor,
-            sql,
-            values[start: start + page_size],
-            template="(%s,%s,%s,%s,%s,%s)",
-            page_size=page_size,
-        )
-    return len(values)
+    stream = _bulk_helpers().EvidenceCopyStream(rows, batch_id, file_id)
+    cursor.copy_expert(
+        f"COPY {table} (batch_id,file_id,source_row_number,{key_column},"
+        "raw_payload,validation_errors) FROM STDIN WITH (FORMAT text)",
+        stream,
+        size=65536,
+    )
+    return stream.count
 
 
 def _complete_file(cursor: Any, file_id: str, parsed: ParsedSourceFile) -> None:
@@ -971,7 +1131,22 @@ def _payload_dict(value: Any) -> dict[str, Any]:
     raise ValueError("Evidence raw_payload is not a JSON object")
 
 
+_ALIAS_TARGET = {alias.strip().casefold(): name
+                 for name, aliases in COLUMN_ALIASES.items() for alias in aliases}
+
+
+class _CanonicalPayload(dict):
+    """First matching payload key wins, including a null first alias."""
+    def __init__(self, payload):
+        super().__init__()
+        for key, value in payload.items():
+            normalised = _normalise_name(key)
+            self.setdefault(_ALIAS_TARGET.get(normalised, normalised), value)
+
+
 def _payload_value(payload: Mapping[str, Any], name: str) -> Any:
+    if isinstance(payload, _CanonicalPayload):
+        return payload.get(name if name in COLUMN_ALIASES else _normalise_name(name))
     wanted = {
         _normalise_name(alias)
         for alias in COLUMN_ALIASES.get(name, (name,))
@@ -1084,6 +1259,7 @@ def _canonical_customer_row(
         source_customer_id: Any,
         payload: Mapping[str, Any],
 ) -> dict[str, Any]:
+    payload = _CanonicalPayload(payload)
     first_name = _text_value(_payload_value(payload, "first_name"))
     middle_name = _text_value(_payload_value(payload, "middle_name"))
     last_name = _text_value(_payload_value(payload, "last_name"))
@@ -1166,47 +1342,50 @@ def _canonical_customer_row(
     }
 
 
-def _build_customer_csv(
-        connection: Any,
-        batch_id: str,
-        source_code: str,
-) -> tuple[bytes, int]:
-    with connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT DISTINCT ON (source_customer_id)
-                       source_customer_id,
-                       raw_payload
-                FROM raw.customer_landing_source
-                WHERE batch_id = %s
-                  AND source_customer_id IS NOT NULL
-                  AND btrim(source_customer_id) <> ''
-                ORDER BY source_customer_id,
-                         source_row_number DESC,
-                         source_record_id DESC
-                """,
-                (batch_id,),
-            )
-            customers = cursor.fetchall()
-
-    output = io.StringIO(newline="")
-    writer = csv.DictWriter(
-        output,
-        fieldnames=CSV_COLUMNS,
-        extrasaction="ignore",
-        lineterminator="\n",
-    )
-    writer.writeheader()
-    for source_customer_id, raw_payload in customers:
-        payload = _payload_dict(raw_payload)
-        writer.writerow(_canonical_customer_row(source_customer_id, payload))
-
-    # utf-8-sig inserts a BOM, which the downstream Lambda explicitly accepts.
-    return output.getvalue().encode("utf-8-sig"), len(customers)
+def _build_customer_csv_spooled(
+        connection: Any, batch_id: str, source_code: str, *,
+        spool_limit: int = 8 * 1024 * 1024,
+):
+    """Bound memory with a server cursor and a seekable disk-backed S3 body."""
+    import uuid
+    output = _bulk_helpers().SpooledCSV(spool_limit)
+    try:
+        writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS,
+                                extrasaction="ignore", lineterminator="\n")
+        writer.writeheader()
+        with connection:
+            with connection.cursor(name="landing_export_" + uuid.uuid4().hex) as cursor:
+                cursor.itersize = 256
+                cursor.execute(
+                    """
+                    SELECT DISTINCT ON (source_customer_id)
+                           source_customer_id, raw_payload
+                    FROM raw.customer_landing_source
+                    WHERE batch_id = %s
+                      AND source_customer_id IS NOT NULL
+                      AND btrim(source_customer_id) <> ''
+                    ORDER BY source_customer_id, source_row_number DESC,
+                             source_record_id DESC
+                    """, (batch_id,),
+                )
+                for source_customer_id, raw_payload in cursor:
+                    writer.writerow(_canonical_customer_row(
+                        source_customer_id, _payload_dict(raw_payload)))
+                    output.row_count += 1
+        output.body.seek(0)
+        return output
+    except BaseException:
+        output.body.close()
+        raise
 
 
-def _mark_output_failed(connection: Any, batch_id: str, error: str) -> None:
+def _build_customer_csv(connection: Any, batch_id: str, source_code: str) -> tuple[bytes, int]:
+    """Compatibility for small callers; production uses the spooled variant."""
+    with _build_customer_csv_spooled(connection, batch_id, source_code) as output:
+        return output.body.read(), output.row_count
+
+
+def _mark_output_failed(connection: Any, batch_id: str, error: str, *, before_commit=None) -> None:
     with connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1220,6 +1399,8 @@ def _mark_output_failed(connection: Any, batch_id: str, error: str) -> None:
                 """,
                 (error[:2000], batch_id),
             )
+            if before_commit:
+                before_commit(cursor)
 
 
 def _head_matches_output(
@@ -1252,7 +1433,7 @@ def _publish_conditionally(
         s3_client: Any,
         bucket: str,
         key: str,
-        body: bytes,
+        body: Any,  # bytes or a seekable binary file; single conditional PUT
         batch_id: str,
         source_code: str,
         sha256: str,
@@ -1327,6 +1508,7 @@ def _reconcile_output(
         s3_client: Any,
         config: Config,
         batch_id: str,
+        *, before_commit=None,
 ) -> dict[str, Any]:
     _acquire_output_lock(connection, batch_id)
     try:
@@ -1360,6 +1542,8 @@ def _reconcile_output(
                     published_key,
                     published_rows,
                 ) = batch
+                if before_commit:
+                    before_commit(cursor)
                 if output_status == "PUBLISHED":
                     return {
                         "status": "published",
@@ -1431,48 +1615,50 @@ def _reconcile_output(
                     """,
                     (output_bucket, output_key, batch_id),
                 )
+                if before_commit:
+                    before_commit(cursor)
 
         LOGGER.info(
             "csv_build_started batch_id=%s source_code=%s",
             batch_id,
             source_code,
         )
-        csv_bytes, row_count = _build_customer_csv(
+        with _build_customer_csv_spooled(
             connection, batch_id, source_code
-        )
-        if row_count == 0:
-            error = "valid_customer_rows_zero"
-            _mark_output_failed(connection, batch_id, error)
-            LOGGER.warning(
-                "csv_not_published batch_id=%s reason=%s", batch_id, error
+        ) as exported:
+            row_count = exported.row_count
+            if row_count == 0:
+                error = "valid_customer_rows_zero"
+                _mark_output_failed(connection, batch_id, error, before_commit=before_commit)
+                LOGGER.warning(
+                    "csv_not_published batch_id=%s reason=%s", batch_id, error
+                )
+                return {
+                    "status": "not_published_no_valid_customers",
+                    "batch_id": batch_id,
+                    "source_code": source_code,
+                    "batch_ref": batch_ref,
+                    "output_rows": 0,
+                }
+
+            sha256 = exported.sha256
+            LOGGER.info(
+                "s3_publish_started batch_id=%s bucket=%s key=%s rows=%d",
+                batch_id,
+                output_bucket,
+                output_key,
+                row_count,
             )
-            return {
-                "status": "not_published_no_valid_customers",
-                "batch_id": batch_id,
-                "source_code": source_code,
-                "batch_ref": batch_ref,
-                "output_rows": 0,
-            }
-
-        sha256 = hashlib.sha256(csv_bytes).hexdigest()
-        LOGGER.info(
-            "s3_publish_started batch_id=%s bucket=%s key=%s rows=%d",
-            batch_id,
-            output_bucket,
-            output_key,
-            row_count,
-        )
-        etag, created = _publish_conditionally(
-            s3_client,
-            output_bucket,
-            output_key,
-            csv_bytes,
-            batch_id,
-            source_code,
-            sha256,
-            row_count,
-        )
-
+            etag, created = _publish_conditionally(
+                s3_client,
+                output_bucket,
+                output_key,
+                exported.body,
+                batch_id,
+                source_code,
+                sha256,
+                row_count,
+            )
         with connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1499,6 +1685,8 @@ def _reconcile_output(
                         batch_id,
                     ),
                 )
+                if before_commit:
+                    before_commit(cursor)
 
         LOGGER.info(
             "s3_publish_complete batch_id=%s rows=%d created=%s",
@@ -1520,7 +1708,7 @@ def _reconcile_output(
     except Exception as exc:
         safe_error = f"output_failed:{type(exc).__name__}:{str(exc)[:1200]}"
         try:
-            _mark_output_failed(connection, batch_id, safe_error)
+            _mark_output_failed(connection, batch_id, safe_error, before_commit=before_commit)
         except Exception:
             LOGGER.exception(
                 "output_failure_status_update_failed batch_id=%s", batch_id
@@ -1532,11 +1720,35 @@ def _reconcile_output(
 
 
 def _process_source(
-        source: SourceObject,
-        downloaded: DownloadedObject,
-        connection: Any,
-        s3_client: Any,
-        config: Config,
+        source: SourceObject, downloaded: DownloadedObject, connection: Any,
+        s3_client: Any, config: Config, *, before_commit=None,
+) -> dict[str, Any]:
+    """Callable worker entry; retry registered work after a hard kill.
+
+    Hold one session lock across registration, parsing, commit and publication.
+    A dead DB session releases the lock, so PROCESSING age is not a lease. The
+    durable worker must retry exceptions/busy locks, and may supply a transaction
+    fence (NOT job completion) before evidence/output commits. Own this connection
+    exclusively. Old unguarded Lambda writers must be drained before rollout.
+    """
+    lock_key = f"landing-worker:{source.source_code}:{source.batch_ref}"
+    with connection, connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock(hashtextextended(%s,0))", (lock_key,))
+        acquired = cursor.fetchone()[0]
+    if not acquired:
+        raise RuntimeError("landing_source_busy: retry this durable job")
+    try:
+        return _process_source_locked(source, downloaded, connection, s3_client,
+                                      config, before_commit=before_commit)
+    finally:
+        connection.rollback()
+        with connection, connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))", (lock_key,))
+
+
+def _process_source_locked(
+        source: SourceObject, downloaded: DownloadedObject, connection: Any,
+        s3_client: Any, config: Config, *, before_commit=None,
 ) -> dict[str, Any]:
     with connection:
         with connection.cursor() as cursor:
@@ -1544,8 +1756,10 @@ def _process_source(
                 cursor, source.source_code, source.batch_ref
             )
             file_id, action = _register_file(
-                cursor, batch_id, source, downloaded
+                cursor, batch_id, source, downloaded, resume_processing=True
             )
+            if before_commit:
+                before_commit(cursor)
 
     LOGGER.info(
         "source_registered source_code=%s batch_ref=%s batch_id=%s "
@@ -1582,12 +1796,14 @@ def _process_source(
             required_key,
         )
         try:
-            parsed = parse_source_evidence(
+            parsed = parse_source_evidence_spooled(
                 downloaded.content,
                 source.file_format,
                 required_key,
             )
-        except Exception as exc:
+        except (SourceCapacityError, MemoryError, OSError):
+            raise
+        except (ValueError, pd.errors.ParserError) as exc:
             safe_error = (
                 f"source_parse_failed:{source.file_format}:"
                 f"{type(exc).__name__}:{str(exc)[:800]}"
@@ -1596,6 +1812,8 @@ def _process_source(
                 with connection.cursor() as cursor:
                     _fail_file(cursor, file_id, safe_error)
                     batch_status = _refresh_batch_status(cursor, batch_id)
+                    if before_commit:
+                        before_commit(cursor)
             LOGGER.exception(
                 "source_parse_failed batch_id=%s source_type=%s file_format=%s",
                 batch_id,
@@ -1639,23 +1857,12 @@ def _process_source(
                         )
                         _complete_file(cursor, file_id, parsed)
                         batch_status = _refresh_batch_status(cursor, batch_id)
-            except Exception as exc:
-                safe_error = (
-                    f"database_ingest_failed:{type(exc).__name__}:"
-                    f"{str(exc)[:800]}"
-                )
-                try:
-                    with connection:
-                        with connection.cursor() as cursor:
-                            _fail_file(cursor, file_id, safe_error)
-                            _refresh_batch_status(cursor, batch_id)
-                except Exception:
-                    LOGGER.exception(
-                        "file_failure_status_update_failed batch_id=%s file_id=%s",
-                        batch_id,
-                        file_id,
-                    )
-                raise
+                        if before_commit:
+                            before_commit(cursor)
+            finally:
+                # DB failures roll back evidence + completion, remain retryable;
+                # never turn transient transport/fence errors into INVALID.
+                parsed.__exit__(None, None, None)
 
             source_result = {
                 "status": (
@@ -1690,7 +1897,7 @@ def _process_source(
             )
 
     output_result = _reconcile_output(
-        connection, s3_client, config, batch_id
+        connection, s3_client, config, batch_id, before_commit=before_commit
     )
     source_result["output"] = output_result
     return source_result
@@ -1716,12 +1923,14 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict[str, Any]:
     )
 
     sources: list[SourceObject] = []
+    accepted_records = []
     rejected: list[dict[str, Any]] = []
     for record in event_records:
         try:
             source = _source_from_record(record, config)
             if source is not None:
                 sources.append(source)
+                accepted_records.append(record)
         except ValueError as exc:
             LOGGER.warning("source_event_rejected reason=%s", str(exc))
             rejected.append({"status": "rejected", "reason": str(exc)})
@@ -1741,6 +1950,38 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict[str, Any]:
         len(sources),
         len(rejected),
     )
+    if os.getenv('CUSTOMER_LANDING_ENABLED', 'false').lower() == 'true':
+        # ACK only after each job is committed to the durable outbox. A later
+        # failure retries the event; enqueue's S3 identity is idempotent.
+        ingress = boto3.client('lambda')
+        function_name = _required_environment('CUSTOMER_INGESTION_FUNCTION_ARN')
+        jobs = []
+        for record in accepted_records:
+            response = ingress.invoke(
+                FunctionName=function_name,
+                InvocationType='RequestResponse',
+                Payload=json.dumps({'action': 'customer_ingestion_enqueue',
+                                    'stage': 'landing', 'Records': [record]}).encode(),
+            )
+            body = response.get('Payload')
+            try:
+                if response.get('StatusCode') != 200 or response.get('FunctionError') or body is None:
+                    raise RuntimeError('Durable landing enqueue failed')
+                payload = json.loads(body.read())
+                record_jobs = payload.get('results') if isinstance(payload, dict) else None
+                if not isinstance(record_jobs, list) or len(record_jobs) != 1:
+                    raise RuntimeError('Durable landing enqueue response incomplete')
+                job = record_jobs[0]
+                if not isinstance(job, dict) or job.get('status') not in {'QUEUED', 'ACTIVE', 'SUCCEEDED', 'FAILED'}:
+                    raise RuntimeError('Durable landing enqueue response invalid')
+                uuid.UUID(job['job_id'])
+                jobs.append(job)
+            finally:
+                if body is not None:
+                    body.close()
+        return {'status': 'queued', 'processed_records': 0,
+                'queued_records': len(jobs), 'results': rejected + jobs}
+
     LOGGER.info("secret_load_started")
     secret = _get_secret(config.db_secret_id)
     LOGGER.info("secret_load_complete")
@@ -1752,6 +1993,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict[str, Any]:
     results = list(rejected)
     try:
         for source in sources:
+            downloaded = None
             try:
                 LOGGER.info(
                     "s3_download_started source_code=%s batch_ref=%s "
@@ -1801,6 +2043,9 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict[str, Any]:
                         "reason": str(exc),
                     }
                 )
+            finally:
+                if downloaded is not None:
+                    downloaded.__exit__(None, None, None)
     finally:
         connection.close()
 

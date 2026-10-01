@@ -23,6 +23,7 @@ if (
     _raw_lambda is None
     and not config.get('connector_runtime_stack')
     and not config.get('standardization_runtime_stack')
+    and not config.get('customer_ingestion_runtime_stack')
 ):
     raise AssertionError(
         "env.yaml must define lambda_stack(s) or connector_runtime_stack"
@@ -94,6 +95,14 @@ if config.get('standardization_runtime_stack'):
         project_config=standardization_stack_config['project_config'],
         env=ENV,
         tags=tags,
+    )
+
+if config.get('customer_ingestion_runtime_stack'):
+    from cdk_stacks.customer_ingestion_runtime_stack import CustomerIngestionRuntimeStack
+    runtime_config = config['customer_ingestion_runtime_stack']
+    CustomerIngestionRuntimeStack(
+        app, runtime_config['stack_name'],
+        project_config=runtime_config['project_config'], env=ENV, tags=tags,
     )
 
 if config.get('api_gtw_stack'):

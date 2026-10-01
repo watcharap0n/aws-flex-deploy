@@ -34,7 +34,7 @@ SELECT
     count(*) AS staging_rows,
     count(*) FILTER (WHERE r.raw_customer_id IS NULL) AS orphaned_from_raw
 FROM staging.customer_profile AS s
-LEFT JOIN raw.customer AS r USING (raw_customer_id);
+LEFT JOIN raw.customer_current AS r USING (raw_customer_id);
 
 SELECT
     count(*) AS entity_members,

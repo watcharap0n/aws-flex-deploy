@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import date, datetime, timezone
@@ -145,11 +146,12 @@ def prepare_customers(
         csv_bytes: bytes,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Read, validate, and deduplicate the canonical customer CSV."""
-    text_stream = io.TextIOWrapper(
-        io.BytesIO(csv_bytes),
-        encoding="utf-8-sig",
-        newline="",
-    )
+    return prepare_customer_stream(io.BytesIO(csv_bytes))
+
+
+def prepare_customer_stream(binary_stream, customer_store=None):
+    """The same parser with an optional disk-backed, last-valid-row store."""
+    text_stream = io.TextIOWrapper(binary_stream, encoding="utf-8-sig", newline="")
     reader = csv.DictReader(text_stream)
     fieldnames = reader.fieldnames or []
     available_columns = set(fieldnames)
@@ -171,7 +173,7 @@ def prepare_customers(
     received = 0
     rejected = 0
     valid_count = 0
-    customers_by_source_id: Dict[str, Dict[str, Any]] = {}
+    customers_by_source_id = {} if customer_store is None else customer_store
     for input_row in reader:
         received += 1
         raw_payload = {
@@ -199,6 +201,13 @@ def prepare_customers(
             date_of_birth = _date_value(row["date_of_birth"])
             birthday = _date_value(row["birthday"])
             age = _integer_value(row["age"], "age")
+            if age is not None and age < 0:
+                raise ValueError("age must be nonnegative")
+            status = {"ใช้งาน": "ACTIVE", "ปิดใช้งาน": "INACTIVE"}.get(
+                row["status"], _optional(row["status"].upper()) or "ACTIVE"
+            )
+            if status not in {"ACTIVE", "INACTIVE", "BLOCKED", "DELETED", "SUSPENDED", "PENDING"}:
+                raise ValueError("unsupported customer status")
             source_created_at = _timestamp_value(row["source_created_at"])
             source_updated_at = _timestamp_value(row["source_updated_at"])
         except (TypeError, ValueError):
@@ -261,9 +270,7 @@ def prepare_customers(
             "apple_id": direct_identifiers["apple_id"],
             "member_code": direct_identifiers["member_code"],
             "customer_type": _optional(row["customer_type"]),
-            "status": {"ใช้งาน": "ACTIVE", "ปิดใช้งาน": "INACTIVE"}.get(
-                row["status"], _optional(row["status"].upper()) or "ACTIVE"
-            ),
+            "status": status,
             "language": _optional(row["language"]),
             "source": _optional(row["source"]),
             "source_system": _optional(row["source_system"]),
@@ -276,7 +283,7 @@ def prepare_customers(
         valid_count += 1
         customers_by_source_id[customer["source_customer_id"]] = customer
 
-    customers = list(customers_by_source_id.values())
+    customers = list(customers_by_source_id.values()) if customer_store is None else customer_store
     duplicates = valid_count - len(customers)
 
     return customers, {
@@ -313,6 +320,17 @@ def _upsert_customers(
         batch_id: str,
         source_system_id: int,
 ) -> None:
+    # Explicit activation only; the bulk implementation validates migration 022.
+    # Never fall back after a failed bulk write in an aborted transaction.
+    if os.getenv('CUSTOMER_BULK_ENABLED', 'false').lower() == 'true':
+        from customer_bulk import upsert_customers
+        forward = os.getenv('CUSTOMER_FORWARD_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true'
+        upsert_customers(cursor, customers, batch_id, source_system_id, forward=forward)
+        return
+
+    if os.getenv('CUSTOMER_FORWARD_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true':
+        raise RuntimeError('Customer forward source namespace requires the bulk writer')
+
     from psycopg2.extras import Json, execute_values
 
     if not customers:
@@ -323,7 +341,7 @@ def _upsert_customers(
         raise ValueError("UPSERT_PAGE_SIZE must be greater than zero")
 
     upsert_sql = """
-        INSERT INTO raw.customer (raw_customer_id, batch_id, source_system_id, source_customer_id,
+        INSERT INTO raw.customer_current (raw_customer_id, batch_id, source_system_id, source_customer_id,
                                   external_id, first_name, middle_name, last_name, full_name,
                                   nickname, gender, date_of_birth, birthday, age, email, phone,
                                   line_user_id, facebook_id, google_id, apple_id, member_code,
@@ -534,6 +552,35 @@ def _resolve_landing_lineage(
     return landing_batch_id, str(batch_ref)
 
 
+def _check_forward_source_route(
+        cursor: Any,
+        *,
+        batch_ref: str,
+) -> bool:
+    """038 routes the legacy registration in a BEFORE INSERT trigger, not here."""
+    requested = os.getenv('CUSTOMER_FORWARD_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true'
+    if not requested:
+        return False
+    if os.getenv('CUSTOMER_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true':
+        raise RuntimeError('Customer 037 and forward source namespaces are mutually exclusive')
+    if os.getenv('CUSTOMER_BULK_ENABLED', 'false').lower() != 'true':
+        raise RuntimeError('Customer forward source namespace requires the bulk writer')
+    cursor.execute(
+        "SELECT to_regclass('control.customer_forward_source_activation') IS NOT NULL, "
+        "to_regclass('control.customer_source_namespace_activation') IS NOT NULL"
+    )
+    installed, old_installed = cursor.fetchone()
+    if not installed:
+        raise RuntimeError('Customer forward source schema/writer activation mismatch')
+    if old_installed:
+        raise RuntimeError('Customer 037 and forward source namespaces are mutually exclusive')
+    # Same literal batch_ref shape as 026; no numeric coercion of its app part.
+    if re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-([0-9]+)-[0-9a-f]{12}',
+                    batch_ref) is None:
+        raise ValueError('Customer forward source batch_ref has no proven literal app')
+    return True
+
+
 def _record_batch_members(
         cursor: Any,
         batch_id: str,
@@ -671,7 +718,11 @@ def _seed_validation_records(
         validation_run_id: str,
         landing_batch_id: str,
         source_system_id: int,
+        ingestion_batch_id: str | None = None,
 ) -> None:
+    app_id = (None if os.getenv('CUSTOMER_FORWARD_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true'
+              or ingestion_batch_id is None else _source_namespace_app(cursor, ingestion_batch_id))
+    app_filter = "AND customer.app_id = %s" if app_id is not None else ""
     cursor.execute(
         """
         WITH ranked AS (
@@ -751,21 +802,44 @@ def _seed_validation_records(
         JOIN raw.customer_landing_source AS source
           ON source.batch_id = %s
          AND source.source_record_id = classified.source_record_id
-        LEFT JOIN raw.customer AS customer
+        LEFT JOIN raw.customer_current AS customer
           ON classified.selected_for_canonical
          AND customer.source_system_id = %s
          AND customer.source_customer_id::text =
              classified.source_customer_id
+         /* namespace_app_filter */
         LEFT JOIN ingestion_existing_source_snapshot AS existing
           ON existing.source_record_id = classified.source_record_id
-        """,
+        """.replace('/* namespace_app_filter */', app_filter),
         (
             landing_batch_id,
             validation_run_id,
             landing_batch_id,
             source_system_id,
-        ),
+        ) + ((app_id,) if app_id is not None else ()),
     )
+
+
+def _source_namespace_app(cursor: Any, ingestion_batch_id: str | None) -> str | None:
+    """Bind file lookups and bulk merge to the installed namespace contract."""
+    cursor.execute("SELECT to_regclass('control.customer_source_namespace_activation') IS NOT NULL")
+    installed = bool(cursor.fetchone()[0])
+    requested = os.getenv('CUSTOMER_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true'
+    if installed != requested:
+        raise RuntimeError('Customer source namespace schema/writer activation mismatch')
+    if not installed:
+        return None
+    if not ingestion_batch_id or os.getenv('CUSTOMER_BULK_ENABLED', 'false').lower() != 'true':
+        raise RuntimeError('Customer source namespace requires a batch and bulk writer')
+    cursor.execute(
+        'SELECT app_id,error_code FROM control.customer_app_scope_status(%s::uuid)',
+        (ingestion_batch_id,),
+    )
+    row = cursor.fetchone()
+    if row is None or row[0] is None or row[1] is not None:
+        raise RuntimeError('Customer file upload has unproven app source lineage')
+    cursor.execute("SELECT set_config('cdp.customer_source_namespace_writer','file-v1',true)")
+    return row[0]
 
 
 def _create_existing_source_snapshot(
@@ -773,7 +847,11 @@ def _create_existing_source_snapshot(
         *,
         landing_batch_id: str,
         source_system_id: int,
+        ingestion_batch_id: str | None = None,
 ) -> None:
+    app_id = (None if os.getenv('CUSTOMER_FORWARD_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true'
+              or ingestion_batch_id is None else _source_namespace_app(cursor, ingestion_batch_id))
+    app_filter = "AND customer.app_id = %s" if app_id is not None else ""
     cursor.execute(
         """
         CREATE TEMP TABLE ingestion_existing_source_snapshot
@@ -794,16 +872,17 @@ def _create_existing_source_snapshot(
                customer.raw_customer_id,
                member.customer_entity_id AS preexisting_entity_id
         FROM selected_source
-        JOIN raw.customer AS customer
+        JOIN raw.customer_current AS customer
           ON customer.source_system_id = %s
          AND customer.source_customer_id::text =
              selected_source.source_customer_id
+         /* namespace_app_filter */
         LEFT JOIN staging.customer_profile AS profile
           ON profile.raw_customer_id = customer.raw_customer_id
         LEFT JOIN identity.customer_entity_member AS member
           ON member.standardized_record_id = profile.standardized_record_id
-        """,
-        (landing_batch_id, source_system_id),
+        """.replace('/* namespace_app_filter */', app_filter),
+        (landing_batch_id, source_system_id) + ((app_id,) if app_id is not None else ()),
     )
     cursor.execute(
         """
@@ -862,6 +941,9 @@ def _process_record(
         record: Mapping[str, Any],
         s3: Any,
         connection: Any,
+        *,
+        prepared=None,
+        before_commit=None,
 ) -> Dict[str, Any]:
     from psycopg2.extras import Json
 
@@ -871,25 +953,29 @@ def _process_record(
     etag = obj["eTag"].strip('"')
     source_code = derive_source_code(key)
 
-    stage_started = time.perf_counter()
-    response = s3.get_object(Bucket=bucket, Key=key, IfMatch=etag)
-    csv_bytes = response["Body"].read()
-    _log_stage("s3_download", stage_started, bytes=len(csv_bytes))
-
-    stage_started = time.perf_counter()
-    customers, stats = prepare_customers(csv_bytes)
-    _log_stage(
-        "prepare_customers",
-        stage_started,
-        records_received=stats["records_received"],
-        records_loaded=len(customers),
-        records_rejected=stats["records_rejected"],
-    )
+    if prepared is None:
+        stage_started = time.perf_counter()
+        kwargs = dict(Bucket=bucket, Key=key, IfMatch=etag)
+        if obj.get('versionId'):
+            kwargs['VersionId'] = obj['versionId']
+        response = s3.get_object(**kwargs)
+        try:
+            csv_bytes = response["Body"].read()
+        finally:
+            response['Body'].close()
+        _log_stage("s3_download", stage_started, bytes=len(csv_bytes))
+        stage_started = time.perf_counter()
+        customers, stats = prepare_customers(csv_bytes)
+        checksum = hashlib.sha256(csv_bytes).hexdigest()
+        landing_metadata = _landing_metadata(response)
+        del csv_bytes
+        _log_stage("prepare_customers", stage_started,
+                   records_received=stats['records_received'], records_loaded=len(customers),
+                   records_rejected=stats['records_rejected'])
+    else:
+        customers, stats, checksum, landing_metadata = prepared
     if not customers:
         raise ValueError("Customer file contains no valid customer rows")
-    checksum = hashlib.sha256(csv_bytes).hexdigest()
-    landing_metadata = _landing_metadata(response)
-    del csv_bytes
     batch_id = str(uuid.uuid4())
 
     # The context commits before this function returns. ECS is started later.
@@ -910,17 +996,6 @@ def _process_record(
                     ),
                 ),
             )
-            cursor.execute(
-                """
-                INSERT INTO control.source_system (source_code, source_name, source_type, is_active)
-                VALUES (%s, %s, 's3_csv', TRUE)
-                ON CONFLICT (source_code) DO UPDATE SET is_active = TRUE
-                RETURNING source_system_id
-                """,
-                (source_code, source_code.upper()),
-            )
-            source_system_id = cursor.fetchone()[0]
-
             landing_batch_id, batch_ref = _resolve_landing_lineage(
                 cursor,
                 landing_metadata=landing_metadata,
@@ -929,6 +1004,25 @@ def _process_record(
                 checksum=checksum,
                 loaded_rows=len(customers),
             )
+
+            if (os.getenv('CUSTOMER_FORWARD_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true'
+                    and before_commit is None):
+                raise RuntimeError('Customer forward source route requires durable worker commit fence')
+            forward_source = _check_forward_source_route(cursor, batch_ref=batch_ref)
+            cursor.execute(
+                """
+                INSERT INTO control.source_system (source_code, source_name, source_type, is_active)
+                SELECT %s, %s, 's3_csv', TRUE
+                WHERE (to_regclass('control.customer_forward_source_activation') IS NOT NULL) = %s
+                ON CONFLICT (source_code) DO UPDATE SET is_active = TRUE
+                RETURNING source_system_id
+                """,
+                (source_code, source_code.upper(), forward_source),
+            )
+            legacy_source = cursor.fetchone()
+            if legacy_source is None:
+                raise RuntimeError('Customer forward source schema/writer activation mismatch')
+            legacy_source_system_id = legacy_source[0]
 
             cursor.execute(
                 """
@@ -951,11 +1045,11 @@ def _process_record(
                     WHERE ingestion_batch.status = 'failed'
                       AND ingestion_batch.metadata ? 'ingestion_error_code'
                       AND ingestion_batch.landing_batch_id = EXCLUDED.landing_batch_id
-                RETURNING batch_id::text
+                RETURNING batch_id::text, source_system_id
                 """,
                 (
                     batch_id,
-                    source_system_id,
+                    legacy_source_system_id,
                     key,
                     PurePosixPath(key).name,
                     checksum,
@@ -971,19 +1065,30 @@ def _process_record(
                 ),
             )
             inserted = cursor.fetchone()
+            if inserted is not None:
+                source_system_id = inserted[1] if forward_source else legacy_source_system_id
+                if forward_source and (type(source_system_id) is not int or source_system_id <= 0
+                                       or source_system_id == legacy_source_system_id):
+                    raise RuntimeError('Customer forward batch returned no physical source')
             if inserted is None:
                 cursor.execute(
                     """
                     SELECT batch_id::text,
                            status,
                            metadata ->> 'stitching_task_arn',
-                           landing_batch_id::text
+                           landing_batch_id::text,
+                           source_system_id
                     FROM control.ingestion_batch
-                    WHERE source_system_id = %s
+                    WHERE landing_batch_id = %s
                       AND object_name = %s
                       AND checksum = %s
+                      AND batch_ref = %s
+                      AND (%s = FALSE AND source_system_id = %s
+                           OR %s = TRUE AND source_system_id <> %s)
                     """,
-                    (source_system_id, key, checksum),
+                    (landing_batch_id, key, checksum, batch_ref,
+                     forward_source, legacy_source_system_id,
+                     forward_source, legacy_source_system_id),
                 )
                 existing = cursor.fetchone()
                 if existing is None:
@@ -993,7 +1098,11 @@ def _process_record(
                     existing_status,
                     task_arn,
                     existing_landing_batch_id,
+                    existing_source_system_id,
                 ) = existing
+                if forward_source and (type(existing_source_system_id) is not int
+                                       or existing_source_system_id <= 0):
+                    raise RuntimeError('Existing forward ingestion batch has no physical source')
                 if existing_landing_batch_id != landing_batch_id:
                     raise RuntimeError(
                         "Existing ingestion batch has conflicting landing lineage"
@@ -1002,6 +1111,8 @@ def _process_record(
                     raise RuntimeError(
                         f"Existing ingestion batch {existing_batch_id} is not completed"
                     )
+                if before_commit is not None:
+                    before_commit(cursor, existing_batch_id)
                 return {
                     "status": "skipped",
                     "reason": "file already completed",
@@ -1011,6 +1122,8 @@ def _process_record(
                     "stitching_task_arn": task_arn,
                 }
 
+            # The BEFORE INSERT trigger's physical source is authoritative for
+            # every snapshot, bulk write and membership in the same transaction.
             batch_id = inserted[0]
             failure = None
             cursor.execute("SAVEPOINT ingestion_payload")
@@ -1036,10 +1149,16 @@ def _process_record(
                 _log_stage("database_setup", stage_started)
 
                 stage_started = time.perf_counter()
+                if os.getenv('CUSTOMER_BULK_ENABLED','false').lower() == 'true':
+                    cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended('customer-bulk:' || %s::text,0))",
+                        (source_system_id,),
+                    )
                 _create_existing_source_snapshot(
                     cursor,
                     landing_batch_id=landing_batch_id,
                     source_system_id=source_system_id,
+                    ingestion_batch_id=batch_id,
                 )
                 _log_stage("snapshot_existing_records", stage_started)
 
@@ -1057,6 +1176,7 @@ def _process_record(
                     validation_run_id=validation_run_id,
                     landing_batch_id=landing_batch_id,
                     source_system_id=source_system_id,
+                    ingestion_batch_id=batch_id,
                 )
                 _log_stage("seed_validation_records", stage_started)
 
@@ -1125,6 +1245,10 @@ def _process_record(
                     ),
                 )
             except Exception as exc:
+                if before_commit is not None:
+                    # Durable workers retain failures on their separate control
+                    # connection; never commit a revoked worker's payload.
+                    raise
                 # Roll back customer/snapshot/job writes, not the batch identity.
                 # Re-raise AFTER committing failure so S3/Lambda still retries.
                 cursor.execute("ROLLBACK TO SAVEPOINT ingestion_payload")
@@ -1140,6 +1264,8 @@ def _process_record(
                     (Json({"ingestion_error_code": type(exc).__name__}), batch_id),
                 )
                 failure = exc
+            if failure is None and before_commit is not None:
+                before_commit(cursor, batch_id)
     if failure is not None:
         # Database exception details can contain an entire customer row.
         raise RuntimeError(
@@ -1266,6 +1392,10 @@ class StitchingDispatchRejected(RuntimeError):
     """ECS returned a definitive zero-task response, not a lost response."""
 
 
+class StitchingDispatchRetryable(RuntimeError):
+    """ECS definitively launched nothing because of a known transient limit."""
+
+
 def _start_stitching_task(batch_id: str, job_id: str, *, request=None) -> str:
     response = boto3.client("ecs").run_task(
         **(request or _stitching_task_request(batch_id, job_id))
@@ -1273,6 +1403,15 @@ def _start_stitching_task(batch_id: str, job_id: str, *, request=None) -> str:
     failures = response.get("failures") or []
     tasks = response.get("tasks") or []
     if failures and not tasks:
+        # Match only the known Fargate vCPU rejection, never arbitrary capacity
+        # text, mixed failure reasons, or a response that may contain a task.
+        if all(f.get('reason') in {
+            "You've reached the limit on the number of vCPUs you can run concurrently",
+            "You've reached the limit on the number of vCPUs you can run concurrently.",
+            "You’ve reached the limit on the number of vCPUs you can run concurrently",
+            "You’ve reached the limit on the number of vCPUs you can run concurrently.",
+        } for f in failures):
+            raise StitchingDispatchRetryable('ECS RunTask deferred: Fargate vCPU limit')
         reasons = ','.join(sorted({str(f.get('reason','unknown')) for f in failures}))[:500]
         raise StitchingDispatchRejected(f"ECS RunTask rejected: {reasons}")
     if failures:
@@ -1711,7 +1850,48 @@ def _handle_ecs_task_state_change(
     return {"status": "failed", "job_id": job_id, "exit_code": exit_code}
 
 
+def _ingestion_task_request(attempt_id):
+    task = _required_environment('CUSTOMER_INGESTION_TASK_DEFINITION')
+    if not task.rsplit(':',1)[-1].isdigit():
+        raise ValueError('CUSTOMER_INGESTION_TASK_DEFINITION must pin a numeric revision')
+    return dict(cluster=_required_environment('CUSTOMER_INGESTION_CLUSTER'),
+        taskDefinition=task,launchType='FARGATE',platformVersion='LATEST',count=1,
+        clientToken=attempt_id,startedBy=attempt_id,
+        overrides={'containerOverrides':[{'name':_required_environment('CUSTOMER_INGESTION_CONTAINER'),
+            'command':['--attempt-id',attempt_id]}]},
+        networkConfiguration={'awsvpcConfiguration':{
+            'subnets':_environment_list('CUSTOMER_INGESTION_SUBNETS'),
+            'securityGroups':_environment_list('CUSTOMER_INGESTION_SECURITY_GROUPS'),
+            'assignPublicIp':'DISABLED'}},enableECSManagedTags=True)
+
+
 def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
+    action = event.get('action')
+    durable = os.getenv('CUSTOMER_INGESTION_ENABLED','false').lower() == 'true'
+    if action in ('customer_ingestion_tick','customer_ingestion_enqueue','customer_ingestion_job_status') or (durable and event.get('Records')):
+        if not durable:
+            raise RuntimeError('Durable customer ingestion is disabled')
+        import customer_ingestion_runtime as runtime
+        connection = _connect()
+        try:
+            if action == 'customer_ingestion_job_status':
+                return runtime.job_status(connection,event['job_id'])
+            if action == 'customer_ingestion_tick':
+                return runtime.tick(connection,boto3.client('ecs'),_ingestion_task_request,
+                                    cluster=_required_environment('CUSTOMER_INGESTION_CLUSTER'))
+            records = event.get('Records') or []
+            if not records:
+                raise ValueError('No S3 Records in event')
+            results=[]
+            for record in records:
+                key=unquote_plus(record['s3']['object']['key'])
+                stage=event.get('stage') or ('landing' if key.startswith('data_sources/') else 'canonical')
+                if stage=='landing' and os.getenv('CUSTOMER_LANDING_ENABLED','false').lower()!='true':
+                    raise RuntimeError('Durable landing ingestion is disabled')
+                results.append(runtime.enqueue(connection,record,stage=stage))
+            return {'results':results}
+        finally:
+            connection.close()
     if event.get("action") in {"stitching_admission_tick", "stitching_job_status"}:
         import sys
         import stitching_admission
@@ -1732,6 +1912,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
     ) == "ECS Task State Change":
         connection = _connect()
         try:
+            if durable:
+                import customer_ingestion_runtime as runtime
+                result = runtime.stopped(connection,event.get('detail') or {})
+                if result['status'] != 'ignored':
+                    return result
             return _handle_ecs_task_state_change(event, connection)
         finally:
             connection.close()
@@ -1739,6 +1924,9 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
     records = event.get("Records", [])
     if not records:
         raise ValueError("No S3 Records in event")
+
+    if os.getenv('CUSTOMER_FORWARD_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true':
+        raise RuntimeError('Customer forward source route requires the durable ingestion worker')
 
     s3 = boto3.client("s3")
     connection = _connect()

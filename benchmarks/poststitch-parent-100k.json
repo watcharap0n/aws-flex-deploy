@@ -1,0 +1,23 @@
+{
+  "kind": "synthetic-local-real-pg-ch",
+  "rows": 100000,
+  "source_sha256": "5cff1b56a0cba4c197d0581f7b859156d395c195989c8f66034b4af905240d9e",
+  "seed_seconds": 4.574469749990385,
+  "transfer_wall_seconds": 47.45722579199355,
+  "stages": {
+    "load_seconds": 16.093678291974356,
+    "verify_publish_seconds": 31.34001458302373,
+    "total_seconds": 47.43369287499809
+  },
+  "resolved_projection_read_seconds": 9.014178042009007,
+  "replay_seconds": 33.9691002079926,
+  "physical_rows": 100000,
+  "markers": 1,
+  "profile_rows": 100000,
+  "mapping_rows": 100000,
+  "inserts": 22,
+  "max_insert_rows": 4827,
+  "max_insert_bytes": 8388590,
+  "clickhouse_version": "25.8.33.6",
+  "note": "fresh resolved projection; does not measure parent legacy-overlay migration"
+}

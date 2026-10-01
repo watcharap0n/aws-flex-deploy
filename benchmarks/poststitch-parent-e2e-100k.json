@@ -1,0 +1,14 @@
+{
+  "kind": "real-migration024-025-cutover-worker-local-synthetic",
+  "users": 100000,
+  "legacy_rows": 1,
+  "seed_and_capture_seconds": 22.276727207994554,
+  "transfer_wall_seconds": 43.18806016698363,
+  "timings": {
+    "load_seconds": 15.169295667001279,
+    "verify_publish_seconds": 27.820989333005855,
+    "total_seconds": 42.990285000007134
+  },
+  "overlay_full_read_seconds": 3.1446977090090513,
+  "source_sha256": "35eb515b70c66ff1f1f41662625f5404baa8e2ce764006f988224904a6ff2734"
+}
