@@ -180,6 +180,7 @@ def run_attempt(attempt_id, *, connect=ingestion._connect, s3=None, task_arn=Non
         # Ingestion success and the existing QUEUED stitching outbox were committed
         # together. No direct RunTask, no second success/ack transaction.
         ingestion._log_stage('worker_to_commit',started,attempt_id=attempt_id,job_id=str(job['job_id']))
+        kick_admission()
         return result
     except BaseException as exc:
         if payload:
@@ -193,6 +194,22 @@ def run_attempt(attempt_id, *, connect=ingestion._connect, s3=None, task_arn=Non
         if payload:
             payload.close()
         control.close()
+
+
+def kick_admission():
+    """Run stitching admission now instead of waiting up to a minute for its schedule.
+
+    Best effort: the job is already committed QUEUED and the 1-minute schedule
+    still admits it if this async invoke is lost. Admission is single-flight.
+    """
+    function = os.getenv('STITCHING_ADMISSION_FUNCTION_ARN')
+    if not function:
+        return
+    try:
+        boto3.client('lambda').invoke(FunctionName=function,InvocationType='Event',
+                                      Payload=json.dumps({'action':'stitching_admission_tick'}).encode())
+    except Exception as exc:
+        LOGGER.warning('stitching_admission_kick_failed error=%s',type(exc).__name__)
 
 
 def task_identity():
