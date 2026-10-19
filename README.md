@@ -223,6 +223,122 @@ cdk bootstrap aws://<aws_account_id>/<aws_region>
 
 ## Deploying the CDK Stack
 
+### Customer ingestion contract
+
+The customer landing flow accepts exactly one source file per source and batch:
+
+```text
+data_sources/<source_code>/<batch_ref>/customers/<file>.(csv|xlsx|json)
+```
+
+The only required source column is `source_customer_id`. Optional source
+columns are `external_id`, `first_name`, `middle_name`, `last_name`,
+`full_name`, `nickname`, `email`, `phone`, `gender`, `date_of_birth`,
+`birthday`, `age`, `line_user_id`, `facebook_id`, `google_id`, `apple_id`,
+`member_code`, `customer_type`, `status`, `language`, `address_line_1`,
+`address_line_2`, `district`, `province`, `postal_code`, `country`, `source`,
+`source_system`, `external_ids`, `attributes`, `source_created_at`, and
+`source_updated_at`.
+
+`raw_customer_id`, `batch_id`, `source_system_id`, `raw_payload`, `created_at`,
+`updated_at`, and `ingested_at` are pipeline-managed and must not be supplied by
+the source file. `customer_id` is a nullable legacy database column; it is not
+the source identifier and is intentionally not part of the upload contract.
+
+The CRM aliases `StoreCode`, `FirstName`, `LastName`, `ContactNumber`, and
+`RegisterDate` remain accepted during the cut-over. The landing Lambda writes:
+
+```text
+raw/<source_code>/<landing_batch_id>/customer.csv
+```
+
+Apply the database migration before deploying the Lambda stacks:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/migrations/013_single_customer_source.sql
+```
+
+Apply pipeline lineage and stitching tracking before deploying the updated
+ingestion Lambda or Fargate image:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/migrations/014_pipeline_tracking.sql
+
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/queries/verify_pipeline_tracking.sql
+```
+
+Then apply the customer data-quality snapshot migration. Migration 015 must be
+present before either the updated ingestion Lambda or Fargate image is
+deployed:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/migrations/015_customer_data_quality.sql
+
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/queries/verify_customer_data_quality.sql
+```
+
+Allow different source records to carry the same external identity signal.
+`raw.customer` remains unique by `(source_system_id, source_customer_id)`;
+identity merging belongs to the downstream stitcher:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/migrations/016_shared_customer_external_ids.sql
+```
+
+The quality layer is DB-first and runs between standardization and stitching.
+Data findings are informational and do not stop stitching; a technical
+validation or snapshot-write failure marks the pipeline `FAILED` with
+`error_stage = 'VALIDATION'` and prevents the resolver from starting.
+
+`control.customer_pipeline_status` is the read-only contract for a future API.
+Query it with the public landing batch ID:
+
+```sql
+SELECT *
+FROM control.customer_pipeline_status
+WHERE landing_batch_id = $1;
+```
+
+The two PII-safe detail contracts use the same public ID:
+
+```sql
+SELECT *
+FROM control.customer_data_quality_metric
+WHERE landing_batch_id = $1;
+
+SELECT *
+FROM control.customer_data_quality_record
+WHERE landing_batch_id = $1;
+```
+
+Migration 015 intentionally does not backfill old batches. For historical
+batches `control.customer_pipeline_status.validation_available` remains
+`false`, because current-state raw/staging rows cannot recreate a trustworthy
+arrival-time snapshot.
+
+After a test upload, run the read-only verification queries:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f database/queries/verify_customer_pipeline.sql
+```
+
+Deploy the landing stack before the ingestion stack so no new canonical output
+is consumed by the old ingestion contract.
+
+For a tracking-only release, deploy the Fargate image/task revision first and
+then deploy only the ingestion stack:
+
+```sh
+CONFIG_FILE=env.yaml cdk deploy CdpIngestionData
+```
+
 To deploy the stack, run:
 
 ```sh
@@ -238,6 +354,137 @@ If you need to remove the stack, run:
 ```sh
 cdk destroy
 ```
+
+## Elasticsearch standardization runtime stack
+
+`StandardizationRuntimeStack` creates the dedicated queues, dispatcher, and
+one-shot Fargate task definition. Destination merges are serialized per source
+system inside PostgreSQL so monthly-index workers cannot block each other on
+shared customer-key tuples. For the initial large baseline use `page_size:
+1000`, `load_statement_timeout_seconds: 900`, and
+`merge_lock_timeout_seconds: 1800` in the ECS configuration. Deploying these
+values registers a new task-definition revision; already-running tasks keep
+their previous image and environment.
+
+Validate and deploy only this stack:
+
+```sh
+.venv/bin/pytest -q tests/unit/test_standardization_runtime_stack.py
+PATH="$PWD/.venv/bin:$PATH" CONFIG_FILE=env.yaml \
+  cdk diff CdpElasticsearchStandardizationRuntime
+PATH="$PWD/.venv/bin:$PATH" CONFIG_FILE=env.yaml \
+  cdk deploy CdpElasticsearchStandardizationRuntime
+```
+
+The worker image must already exist in ECR at the exact `image_uri` configured
+in `env.yaml`.
+
+## Database connector runtime stack
+
+`ConnectorRuntimeStack` is the AWS orchestration half of database connector
+intake. It creates encrypted occurrence/dispatch/result queues and DLQs,
+EventBridge Scheduler group/role, an idempotent dispatch Lambda, a Standard Step
+Functions workflow, logs, alarms, and least-privilege IAM policies. When the
+fast worker is enabled, it additionally creates a standard fast-operation queue
+and standard DLQ.
+
+The stack imports the ECS cluster, existing one-shot connector and identity
+stitcher task definitions, network references, and connector task role. When
+`ecs.fast_worker_enabled` is `true`, it also creates a dedicated task role, task
+definition, and continuously running Fargate service for fast operations. The
+service runs `consume-fast` in private subnets without a public IP or load
+balancer and uses ECS deployment-circuit-breaker rollback. The stack does not
+create an ECS cluster, ECR repository, or container image. Copy
+[env.connector.example.yaml](env.connector.example.yaml) and replace every
+placeholder with an existing reference before synth or deployment.
+
+`ecs.fast_worker_enabled` defaults to `false`, preserving the legacy stack when
+the image settings are absent. When enabled, `ecs.fast_worker_image_uri` and
+`ecs.fast_worker_container_name` are required. The image URI must reference a
+private ECR repository in the same AWS account and region as the stack and must
+be pinned by digest in the form
+`<account>.dkr.ecr.<region>.amazonaws.com/<repository>@sha256:<64 lowercase hex characters>`.
+The worker defaults to 1024 CPU units, 2048 MiB memory, one desired task,
+`ecs.fast_worker_capacity_provider: FARGATE`, and a 110-second shutdown grace
+period. Set the capacity provider to `FARGATE_SPOT` to use lower-cost,
+interruptible Spot capacity; only `FARGATE` and `FARGATE_SPOT` are accepted.
+Queue visibility defaults to 300 seconds. The heartbeat, long-poll,
+maximum-attempt, graceful-shutdown, oldest-message-age-alarm, and backlog-alarm
+settings are configurable as shown in the example file. The worker task
+receives these environment variables from CDK; no database credential value is
+stored in YAML:
+
+- `AWS_REGION`
+- `DB_SECRET_NAME` (the configured warehouse secret ARN or name)
+- `CONNECTOR_LANDING_BUCKET`
+- `CONNECTOR_KMS_KEY_ID`
+- `CONNECTOR_FAST_OPERATION_QUEUE_URL`
+- `FAST_OPERATION_VISIBILITY_TIMEOUT_SECONDS`
+- `FAST_OPERATION_HEARTBEAT_SECONDS`
+- `FAST_OPERATION_POLL_WAIT_SECONDS`
+- `FAST_OPERATION_MAX_ATTEMPTS`
+- `FAST_OPERATION_SHUTDOWN_GRACE_SECONDS`
+
+The heartbeat must be no more than half the queue visibility timeout. The
+queue redrive count is `fast_worker_max_attempts + 1`: the first deliveries are
+execution attempts, and the final source delivery is reserved for claim logic
+to persist `MAX_EXECUTION_ATTEMPTS` before acknowledging the message. The ECS
+container `StopTimeout` is the configured
+`fast_worker_shutdown_grace_seconds` value. Standard SQS can redeliver a
+message, so the worker's database atomic lease provides idempotency by allowing
+only one active claim for an operation.
+
+The one-shot connector and stitcher tasks default to
+`ecs.workflow_capacity_provider: FARGATE`, which preserves the existing
+`LaunchType: FARGATE` workflow definition. Setting it to `FARGATE_SPOT` instead
+uses an ECS capacity-provider strategy and omits `LaunchType`. Use Spot only as
+a temporary quota fallback, then switch the setting to `FARGATE` after the
+Fargate quota increase is approved. Each workflow ECS task retries
+`ECS.AmazonECSException` before its existing catch path. The retry defaults are
+15 seconds, 20 attempts, a 1.2 backoff rate, and a 60-second maximum delay;
+configure them with `ecs.workflow_retry_interval_seconds`,
+`ecs.workflow_retry_max_attempts`, `ecs.workflow_retry_backoff_rate`, and
+`ecs.workflow_retry_max_delay_seconds`. All four values must be positive.
+
+Runtime routing is split as follows:
+
+- `CONNECTION_TEST`, `SCHEMA_DISCOVERY`, and `DATASET_PREVIEW`: the API sends
+  directly to the standard fast-operation queue for the warm worker. The
+  existing dispatch queue, dispatcher Lambda, and Step Functions route remain
+  available as fallback.
+- `DATASET_SYNC`: imported connector task, then imported identity stitcher with
+  `--batch-id` and `--job-id` through the existing dispatch and Step Functions
+  path.
+- Every terminal path publishes one idempotent result message for the backend
+  result worker.
+
+Validate without deployment:
+
+```sh
+.venv/bin/pytest -q tests/unit/test_connector_runtime_stack.py
+PATH="$PWD/.venv/bin:$PATH" CONFIG_FILE=env.connector.example.yaml \
+  cdk synth CdpDatabaseConnectorRuntime
+```
+
+The synthesized stack additionally outputs the fast-operation queue URL and
+ARN, fast-operation DLQ ARN, fast-worker ECS service name and ARN, task
+definition ARN, and log group name and ARN. Configure the API with the fast
+queue URL; its imported backend role can send to both the existing dispatch
+queue and the new standard queue. Building and publishing the digest-pinned
+worker image remains a separate deployment step.
+
+Use an additive rollout:
+
+1. Publish the worker image and configure `ecs.fast_worker_enabled: true` with
+   its immutable digest.
+2. Keep `CONNECTOR_FAST_OPERATIONS_ENABLED=false` on `journey-builder-api`
+   while deploying this infrastructure and verifying that the warm ECS task is
+   healthy.
+3. Configure the API with both
+   `CONNECTOR_FAST_OPERATION_QUEUE_URL=<ConnectorFastOperationQueueUrl output>`
+   and `CONNECTOR_FAST_OPERATIONS_ENABLED=true` to enable direct routing.
+4. Keep the existing dispatch worker, Lambda, and Step Functions resources in
+   place for fallback and `DATASET_SYNC`.
 
 ## Next Steps
 

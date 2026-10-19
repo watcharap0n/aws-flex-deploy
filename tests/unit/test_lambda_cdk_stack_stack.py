@@ -89,6 +89,28 @@ def test_lambda_stack_allows_configured_timeout():
     )
 
 
+def test_lambda_stack_allows_reserved_concurrency():
+    app = core.App()
+    stack = LambdaStack(
+        app,
+        "test-stack-reserved-concurrency",
+        project_config={
+            "lambda_function_name": "test_fn",
+            "code_from_asset": "_lambda",
+            "function_handler": "lambda_function.lambda_handler",
+            "reserved_concurrent_executions": 1,
+        },
+    )
+
+    template = assertions.Template.from_stack(stack)
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "ReservedConcurrentExecutions": 1,
+        },
+    )
+
+
 def test_lambda_stack_raises_on_unsupported_python_version():
     """Ensure unsupported python_version values fail with a clear error."""
     app = core.App()
@@ -257,3 +279,37 @@ def test_lambda_stack_existing_security_groups_reject_create_fields(monkeypatch)
         )
 
 
+def test_lambda_stack_adds_ecs_stopped_event_rule():
+    app = core.App()
+    stack = LambdaStack(
+        app,
+        "test-stack-ecs-events",
+        project_config={
+            "lambda_function_name": "test_fn",
+            "code_from_asset": "_lambda",
+            "function_handler": "lambda_function.lambda_handler",
+            "ecs_task_state_rule": {
+                "cluster_arn": "arn:aws:ecs:region:account:cluster/test",
+                "task_family": "stitcher",
+            },
+        },
+    )
+
+    template = assertions.Template.from_stack(stack)
+    template.has_resource_properties(
+        "AWS::Events::Rule",
+        {
+            "EventPattern": {
+                "source": ["aws.ecs"],
+                "detail-type": ["ECS Task State Change"],
+                "detail": {
+                    "clusterArn": [
+                        "arn:aws:ecs:region:account:cluster/test"
+                    ],
+                    "group": ["family:stitcher"],
+                    "lastStatus": ["STOPPED"],
+                },
+            },
+            "State": "ENABLED",
+        },
+    )
