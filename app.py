@@ -24,6 +24,8 @@ if (
     and not config.get('connector_runtime_stack')
     and not config.get('standardization_runtime_stack')
     and not config.get('customer_ingestion_runtime_stack')
+    and not config.get('staging_customer_runtime_stack')
+    and not config.get('staging_intake_stack')
 ):
     raise AssertionError(
         "env.yaml must define lambda_stack(s) or connector_runtime_stack"
@@ -105,6 +107,14 @@ if config.get('customer_ingestion_runtime_stack'):
         project_config=runtime_config['project_config'], env=ENV, tags=tags,
     )
 
+if config.get('staging_customer_runtime_stack'):
+    from cdk_stacks.staging_customer_runtime_stack import StagingCustomerRuntimeStack
+    runtime_config = config['staging_customer_runtime_stack']
+    StagingCustomerRuntimeStack(
+        app, runtime_config['stack_name'], project_config=runtime_config['project_config'],
+        env=ENV, tags=tags,
+    )
+
 if config.get('api_gtw_stack'):
     ApiGwStack(
         app,
@@ -113,6 +123,12 @@ if config.get('api_gtw_stack'):
         env=ENV,
         tags=tags,
     )
+
+if config.get('staging_intake_stack'):
+    from cdk_stacks.staging_intake_stack import StagingIntakeStack
+    intake_config = config['staging_intake_stack']
+    StagingIntakeStack(app, intake_config['stack_name'],
+        project_config=intake_config['project_config'], env=ENV, tags=tags)
 
 if config.get('glue_stack'):
     GlueJobStack(

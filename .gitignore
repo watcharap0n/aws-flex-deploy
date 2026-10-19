@@ -13,3 +13,6 @@ cdk.out
 
 # Local benchmark snapshots and historical evidence
 /benchmark-history/
+
+# generated synth/deploy evidence (asset copies); keep local
+outputs/

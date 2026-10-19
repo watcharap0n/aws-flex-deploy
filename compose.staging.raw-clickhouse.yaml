@@ -1,0 +1,13 @@
+services:
+  raw-clickhouse-mirror:
+    build:
+      context: .
+      dockerfile: docker/staging-raw-clickhouse/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      AWS_REGION: ap-southeast-7
+      DB_SECRET_ID: postgres-marketing-automation-dev
+      CLICKHOUSE_SECRET_ID: clickhouse-marketing-automation-dev
+      SYNC_INTERVAL_SECONDS: '60'
+      SYNC_BATCH_SIZE: '500'
