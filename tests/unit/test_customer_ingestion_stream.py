@@ -26,7 +26,9 @@ def test_stream_parser_uses_repeatable_disk_store_without_semantic_drift(tmp_pat
         assert actual is store
         assert list(actual) == expected == list(actual[:])
         assert list(actual) == expected  # repeatable after bulk COPY iteration
-        assert stats == expected_stats == {'records_received': 5, 'records_rejected': 2, 'duplicate_rows': 1}
+        # The age 'no' row is kept (age NULL, text in attributes); only the keyless row is dropped.
+        assert stats == expected_stats == {'records_received': 5, 'records_rejected': 1, 'duplicate_rows': 2,
+                                           'records_normalised': 1, 'normalised_fields': {'age': 1}}
         assert len(actual) == 2
 
 

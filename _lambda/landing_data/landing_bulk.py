@@ -90,13 +90,15 @@ class EvidenceStore:
         self.db = sqlite3.connect(self.directory.name + '/evidence.sqlite')
         self.db.execute('PRAGMA cache_size=-8192')
         self.db.execute('PRAGMA temp_store=FILE')
-        self.db.execute('CREATE TABLE evidence (n INTEGER PRIMARY KEY, key TEXT, payload TEXT NOT NULL)')
+        self.db.execute('CREATE TABLE evidence (n INTEGER PRIMARY KEY, key TEXT, payload TEXT NOT NULL, notes TEXT)')
         self.row_type, self.required_key, self.has_key = row_type, required_key, has_key
         self.count = self.blank_count = self.duplicate_count = 0
 
     def append(self, row):
-        self.db.execute('INSERT INTO evidence VALUES (?,?,?)',
-                        (row.source_row_number, row.source_key, json.dumps(row.raw_payload, ensure_ascii=False)))
+        # Row notes (e.g. derived_key:phone) travel with the row into the quality ledger.
+        self.db.execute('INSERT INTO evidence VALUES (?,?,?,?)',
+                        (row.source_row_number, row.source_key, json.dumps(row.raw_payload, ensure_ascii=False),
+                         json.dumps(row.validation_errors, ensure_ascii=False) if row.validation_errors else None))
         self.count += 1
         if self.has_key and row.source_key is None:
             self.blank_count += 1
@@ -112,17 +114,17 @@ class EvidenceStore:
         return self.count
 
     def __iter__(self):
-        for number, key, payload, duplicate in self.db.execute(
-            'SELECT e.n,e.key,e.payload,d.n FROM evidence e LEFT JOIN duplicates d ON d.key=e.key ORDER BY e.n'
+        for number, key, payload, notes, duplicate in self.db.execute(
+            'SELECT e.n,e.key,e.payload,e.notes,d.n FROM evidence e LEFT JOIN duplicates d ON d.key=e.key ORDER BY e.n'
         ):
-            error = None
+            errors = json.loads(notes) if notes else []
             if not self.has_key:
-                error = 'missing_required_column:' + self.required_key
+                errors.append('missing_required_column:' + self.required_key)
             elif key is None:
-                error = 'missing_or_blank_key:' + self.required_key
+                errors.append('missing_or_blank_key:' + self.required_key)
             elif duplicate:
-                error = 'duplicate_key:' + self.required_key
-            yield self.row_type(number, key, json.loads(payload), [error] if error else None)
+                errors.append('duplicate_key:' + self.required_key)
+            yield self.row_type(number, key, json.loads(payload), errors or None)
 
     def close(self):
         self.db.close()
