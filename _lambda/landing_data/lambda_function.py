@@ -486,6 +486,61 @@ def _matching_columns(columns: Iterable[Any], expected: str) -> list[str]:
     ]
 
 
+# Every row gets a customer key. Without one in the file, the first identifier
+# found becomes the key, in the id_type:value form intake v2 uses; a row with no
+# identifier at all is keyed by a stable fingerprint of its content.
+DERIVED_KEY_SOURCES = (
+    ("member", "member_code"),
+    ("external", "external_id"),
+    ("email", "email"),
+    ("phone", "phone"),
+    ("line", "line_user_id"),
+    ("facebook", "facebook_id"),
+    ("google", "google_id"),
+    ("apple", "apple_id"),
+)
+
+
+def _th_mobile(value: str) -> str | None:
+    digits = re.sub(r"[^0-9]", "", value)
+    if re.fullmatch(r"0[689][0-9]{8}", digits):
+        return digits
+    if re.fullmatch(r"66[689][0-9]{8}", digits):
+        return "0" + digits[2:]
+    if re.fullmatch(r"[689][0-9]{8}", digits):
+        return "0" + digits
+    return None
+
+
+def _derived_customer_key(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """(source_customer_id, id_type) from the row's own identifiers."""
+    for id_type, name in DERIVED_KEY_SOURCES:
+        value = _identifier_text(_payload_value(payload, name))
+        if not value:
+            continue
+        if id_type == "member":
+            value = value.upper()
+        elif id_type == "email":
+            value = value.lower()
+            if "@" not in value:
+                continue
+        elif id_type == "phone":
+            value = _th_mobile(value) or re.sub(r"[^0-9]", "", value)
+            if len(value) < 6:
+                continue
+        return f"{id_type}:{value}", id_type
+    content = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return "row:" + hashlib.sha256(content.encode()).hexdigest()[:32], "row"
+
+
+def _row_key(payload: Mapping[str, Any], key_column: str | None) -> tuple[str, str | None]:
+    """(key, derived id_type or None when the file's own key column supplied it)."""
+    key = _identifier_text(payload.get(key_column)) if key_column else None
+    if key is not None:
+        return key, None
+    return _derived_customer_key(payload)
+
+
 def _is_identifier_header(value: Any) -> bool:
     normalised = _normalise_name(value)
     collapsed = re.sub(r"[^a-z0-9]", "", normalised)
@@ -507,40 +562,41 @@ def _frame_to_evidence(
         spool_rows: bool = False,
 ) -> ParsedSourceFile:
     """Convert a tabular source into the common evidence representation."""
-    required_matches = _matching_columns(frame.columns, required_key)
     frame = frame.copy(deep=False)
     frame.columns = _unique_headers(frame.columns)
     clean_key_matches = _matching_columns(frame.columns, required_key)
     key_column = clean_key_matches[0] if clean_key_matches else None
 
+    # A missing or ambiguous key column no longer rejects the file: the first
+    # match is used, and rows without a key get one derived from their identifiers.
     file_errors: list[str] = []
-    if not required_matches:
-        file_errors.append(f"missing_required_column:{required_key}")
-    elif len(required_matches) > 1:
-        file_errors.append(f"ambiguous_required_column:{required_key}")
     if frame.empty:
         file_errors.append("no_data_rows")
 
     if spool_rows:
-        store = _bulk_helpers().EvidenceStore(EvidenceRow, required_key, key_column is not None)
+        store = _bulk_helpers().EvidenceStore(EvidenceRow, required_key, True)
+        derived_rows = 0
         try:
             columns = list(frame.columns)
             for row_number, values in enumerate(frame.itertuples(index=False, name=None), start=row_number_start):
                 payload = {column: _json_safe(value) for column, value in zip(columns, values)}
-                key = _identifier_text(payload.get(key_column)) if key_column else None
-                store.append(EvidenceRow(row_number, key, payload, None))
+                key, derived = _row_key(payload, key_column)
+                derived_rows += derived is not None
+                store.append(EvidenceRow(row_number, key, payload,
+                                         [f"derived_key:{derived}"] if derived else None))
             store.finish()
             status = "INVALID" if file_errors else (
-                "INGESTED_WITH_WARNINGS" if store.blank_count or store.duplicate_count else "INGESTED")
+                "INGESTED_WITH_WARNINGS" if derived_rows or store.duplicate_count else "INGESTED")
             return ParsedSourceFile(sheet_name, columns, store, status,
                                     ";".join(file_errors) or None,
-                                    store.blank_count, store.duplicate_count)
+                                    derived_rows, store.duplicate_count)
         except BaseException:
             store.close()
             raise
 
     payloads: list[dict[str, Any]] = []
-    source_keys: list[str | None] = []
+    source_keys: list[str] = []
+    derived_types: list[str | None] = []
     columns = list(frame.columns)
     for values in frame.itertuples(index=False, name=None):
         payload = {
@@ -548,24 +604,22 @@ def _frame_to_evidence(
             for column, value in zip(columns, values)
         }
         payloads.append(payload)
-        source_keys.append(
-            _identifier_text(payload.get(key_column)) if key_column else None
-        )
+        key, derived = _row_key(payload, key_column)
+        source_keys.append(key)
+        derived_types.append(derived)
 
-    key_counts = Counter(key for key in source_keys if key is not None)
+    key_counts = Counter(source_keys)
     rows: list[EvidenceRow] = []
     blank_key_rows = 0
     duplicate_key_rows = 0
-    for row_number, (payload, source_key) in enumerate(
-            zip(payloads, source_keys), start=row_number_start
+    for row_number, (payload, source_key, derived) in enumerate(
+            zip(payloads, source_keys, derived_types), start=row_number_start
     ):
         row_errors: list[str] = []
-        if key_column is None:
-            row_errors.append(f"missing_required_column:{required_key}")
-        elif source_key is None:
+        if derived:
             blank_key_rows += 1
-            row_errors.append(f"missing_or_blank_key:{required_key}")
-        elif key_counts[source_key] > 1:
+            row_errors.append(f"derived_key:{derived}")
+        if key_counts[source_key] > 1:
             duplicate_key_rows += 1
             row_errors.append(f"duplicate_key:{required_key}")
 
@@ -1175,7 +1229,13 @@ def _normalise_date(value: Any) -> str:
     if not text:
         return ""
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T ].*)?", text):
-        return text[:10]
+        year = int(text[:4])
+        if year <= 2400:
+            return text[:10]
+        try:  # Thai Buddhist era (พ.ศ.)
+            return date(year - 543, int(text[5:7]), int(text[8:10])).isoformat()
+        except ValueError:
+            return ""
 
     try:
         number = float(text)
@@ -1191,8 +1251,21 @@ def _normalise_date(value: Any) -> str:
     else:
         parsed = pd.to_datetime(text, errors="coerce")
     if pd.isna(parsed):
-        return ""
-    return parsed.date().isoformat()
+        buddhist = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})[/.-](2[45]\d\d)", text)
+        if not buddhist:
+            return ""
+        day, month, year = (int(part) for part in buddhist.groups())
+        try:
+            return date(year - 543, month, day).isoformat()
+        except ValueError:
+            return ""
+    result = parsed.date()
+    if result.year > 2400:  # Thai Buddhist era (พ.ศ.)
+        try:
+            result = result.replace(year=result.year - 543)
+        except ValueError:
+            return ""
+    return result.isoformat()
 
 
 def _normalise_timestamp(value: Any) -> str:
@@ -1224,8 +1297,22 @@ def _json_object(value: Any, field_name: str) -> dict[str, Any]:
     raise ValueError(f"{field_name} must be a JSON object")
 
 
-def _external_ids(payload: Mapping[str, Any]) -> dict[str, Any]:
-    result = _json_object(_payload_value(payload, "external_ids"), "external_ids")
+NULL_TOKENS = frozenset({"none", "null", "nan", "nat", "n/a", "na", "-", "--", "ไม่มี"})
+
+
+def _lenient_json_object(value: Any, field_name: str, invalid: dict[str, str]) -> dict[str, Any]:
+    """Malformed JSON never rejects the file: keep its text, use an empty object."""
+    try:
+        return _json_object(value, field_name)
+    except ValueError:
+        invalid[field_name] = str(value)
+        return {}
+
+
+def _external_ids(payload: Mapping[str, Any], invalid: dict[str, str] | None = None) -> dict[str, Any]:
+    value = _payload_value(payload, "external_ids")
+    result = (_json_object(value, "external_ids") if invalid is None
+              else _lenient_json_object(value, "external_ids", invalid))
 
     legacy_devices = _payload_value(payload, "device_id(s)")
     if not _is_missing(legacy_devices):
@@ -1268,6 +1355,26 @@ def _canonical_customer_row(
         full_name = " ".join(
             part for part in (first_name, middle_name, last_name) if part
         )
+    # Values that cannot be parsed never reject the file; their original text is
+    # kept in attributes.source_invalid_values for analysis.
+    invalid: dict[str, str] = {}
+    external_ids = _external_ids(payload, invalid)
+    attributes = _lenient_json_object(_payload_value(payload, "attributes"), "attributes", invalid)
+    birth_source = (_payload_value(payload, "date_of_birth")
+                    if not _is_missing(_payload_value(payload, "date_of_birth"))
+                    else _payload_value(payload, "birthday"))
+    typed: dict[str, str] = {}
+    for field, raw, normalise in (
+            ("date_of_birth", birth_source, _normalise_date),
+            ("birthday", _payload_value(payload, "birthday"), _normalise_date),
+            ("source_created_at", _payload_value(payload, "source_created_at"), _normalise_timestamp),
+            ("source_updated_at", _payload_value(payload, "source_updated_at"), _normalise_timestamp)):
+        typed[field] = normalise(raw)
+        if not typed[field] and not _is_missing(raw) and str(raw).strip().casefold() not in NULL_TOKENS:
+            invalid[field] = str(raw)
+    if invalid:
+        kept = attributes.get("source_invalid_values")
+        attributes["source_invalid_values"] = {**(kept if isinstance(kept, dict) else {}), **invalid}
 
     return {
         "source_customer_id": _identifier_text(source_customer_id) or "",
@@ -1282,12 +1389,8 @@ def _canonical_customer_row(
         "email": _text_value(_payload_value(payload, "email")),
         "phone": _identifier_text(_payload_value(payload, "phone")) or "",
         "gender": _text_value(_payload_value(payload, "gender")),
-        "date_of_birth": _normalise_date(
-            _payload_value(payload, "date_of_birth")
-            if not _is_missing(_payload_value(payload, "date_of_birth"))
-            else _payload_value(payload, "birthday")
-        ),
-        "birthday": _normalise_date(_payload_value(payload, "birthday")),
+        "date_of_birth": typed["date_of_birth"],
+        "birthday": typed["birthday"],
         "age": _identifier_text(_payload_value(payload, "age")) or "",
         "line_user_id": _identifier_text(
             _payload_value(payload, "line_user_id")
@@ -1326,19 +1429,15 @@ def _canonical_customer_row(
             _payload_value(payload, "source_system")
         ),
         "external_ids": json.dumps(
-            _external_ids(payload), ensure_ascii=False, sort_keys=True
+            external_ids, ensure_ascii=False, sort_keys=True
         ),
         "attributes": json.dumps(
-            _json_object(_payload_value(payload, "attributes"), "attributes"),
+            attributes,
             ensure_ascii=False,
             sort_keys=True,
         ),
-        "source_created_at": _normalise_timestamp(
-            _payload_value(payload, "source_created_at")
-        ),
-        "source_updated_at": _normalise_timestamp(
-            _payload_value(payload, "source_updated_at")
-        ),
+        "source_created_at": typed["source_created_at"],
+        "source_updated_at": typed["source_updated_at"],
     }
 
 

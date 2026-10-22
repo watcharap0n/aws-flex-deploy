@@ -71,13 +71,59 @@ def test_ingestion_normalizes_customer_status(ingestion, raw_status, expected):
 
 @pytest.mark.parametrize('age,status', [('-1','ACTIVE'), ('18','UNRECOGNIZED'),
                                          ('-999','UNKNOWN')])
-def test_ingestion_rejects_rows_that_violate_customer_checks(ingestion, age, status):
+def test_ingestion_keeps_rows_with_out_of_contract_values(ingestion, age, status):
+    # A value outside the contract never rejects the row (2026-10-22): the typed
+    # field is NULL or defaulted and the original text is kept in attributes.
     payload = (f'source_customer_id,age,status\ninvalid,{age},{status}\n'
                'valid,18,SUSPENDED\n').encode()
     customers, stats = ingestion.prepare_customers(payload)
-    assert [customer['source_customer_id'] for customer in customers] == ['valid']
-    assert stats == {'records_received': 2, 'records_rejected': 1,
-                     'duplicate_rows': 0}
+    by_id = {customer['source_customer_id']: customer for customer in customers}
+    assert sorted(by_id) == ['invalid', 'valid']
+    assert stats['records_received'] == 2 and stats['records_rejected'] == 0
+    kept = by_id['invalid']
+    assert kept['status'] == 'ACTIVE'
+    if int(age) < 0:
+        assert kept['age'] is None
+        assert kept['attributes']['source_invalid_values'] == {'age': age}
+    if status != 'ACTIVE':
+        assert kept['attributes']['source_status'] == status
+    assert by_id['valid']['status'] == 'SUSPENDED' and 'source_status' not in by_id['valid']['attributes']
+
+
+@pytest.mark.parametrize('raw,expected', [('resigned', 'INACTIVE'), ('Resigned', 'INACTIVE'),
+                                          ('ลาออก', 'INACTIVE'), ('on hold', 'SUSPENDED'),
+                                          ('banned', 'BLOCKED'), ('vip', 'ACTIVE')])
+def test_ingestion_maps_free_text_statuses_and_keeps_the_source_value(ingestion, raw, expected):
+    customers, stats = ingestion.prepare_customers(
+        f'source_customer_id,status\nemp-1,{raw}\n'.encode())
+    assert stats['records_rejected'] == 0 and stats['records_normalised'] == 1
+    assert customers[0]['status'] == expected
+    assert customers[0]['attributes']['source_status'] == raw
+    kind = 'status_unrecognised' if raw == 'vip' else 'status'
+    assert stats['normalised_fields'] == {kind: 1}
+
+
+def test_ingestion_keeps_unparseable_json_dates_and_timestamps(ingestion):
+    customers, stats = ingestion.prepare_customers(
+        b'source_customer_id,external_ids,attributes,date_of_birth,source_created_at\n'
+        b'c-1,{not json,[1],1990-02-31,yesterday\n')
+    assert stats['records_rejected'] == 0
+    customer = customers[0]
+    assert customer['external_ids'] == {} and customer['date_of_birth'] is None
+    assert customer['source_created_at'] is None
+    assert customer['attributes'] == {'source_invalid_values': {
+        'external_ids': '{not json', 'attributes': '[1]', 'date_of_birth': '1990-02-31',
+        'source_created_at': 'yesterday'}}
+    assert stats['normalised_fields'] == {'attributes': 1, 'date_of_birth': 1, 'external_ids': 1,
+                                          'source_created_at': 1}
+
+
+def test_ingestion_bounds_an_overlong_source_key_instead_of_rejecting(ingestion):
+    key = 'k' * 300
+    customers, stats = ingestion.prepare_customers(f'source_customer_id\n{key}\n'.encode())
+    assert stats['records_rejected'] == 0
+    assert len(customers[0]['source_customer_id']) <= 255
+    assert customers[0]['source_customer_id'].startswith('k' * 200 + '#')
 
 
 def _config(landing):
@@ -165,6 +211,8 @@ def test_ingestion_accepts_minimal_canonical_file(ingestion):
         "records_received": 1,
         "records_rejected": 0,
         "duplicate_rows": 0,
+        "records_normalised": 0,
+        "normalised_fields": {},
     }
     assert customers[0]["source_customer_id"] == "crm-1"
     assert customers[0]["first_name"] == "Ada"
@@ -244,7 +292,7 @@ def test_full_source_customer_schema_reaches_ingestion(landing, ingestion):
     assert customer["source_system"] == "crm"
 
 
-def test_ingestion_rejects_invalid_rows_and_keeps_last_duplicate(ingestion):
+def test_ingestion_keeps_bad_values_rejects_only_keyless_rows_and_last_duplicate_wins(ingestion):
     output = io.StringIO(newline="")
     writer = csv.DictWriter(
         output,
@@ -287,13 +335,19 @@ def test_ingestion_rejects_invalid_rows_and_keeps_last_duplicate(ingestion):
 
     customers, stats = ingestion.prepare_customers(output.getvalue().encode())
 
+    # The unparseable date no longer rejects its row; only the keyless row is dropped.
     assert stats == {
         "records_received": 4,
-        "records_rejected": 2,
+        "records_rejected": 1,
         "duplicate_rows": 1,
+        "records_normalised": 1,
+        "normalised_fields": {"date_of_birth": 1},
     }
-    assert len(customers) == 1
-    assert customers[0]["first_name"] == "New"
+    by_id = {customer["source_customer_id"]: customer for customer in customers}
+    assert sorted(by_id) == ["bad-date", "same-id"]
+    assert by_id["same-id"]["first_name"] == "New"
+    assert by_id["bad-date"]["date_of_birth"] is None
+    assert by_id["bad-date"]["attributes"]["source_invalid_values"] == {"date_of_birth": "01/31/2000"}
 
 
 def test_ingestion_preserves_shared_external_ids_for_stitching(ingestion):
@@ -309,6 +363,8 @@ def test_ingestion_preserves_shared_external_ids_for_stitching(ingestion):
         "records_received": 2,
         "records_rejected": 0,
         "duplicate_rows": 0,
+        "records_normalised": 0,
+        "normalised_fields": {},
     }
     assert [customer["source_customer_id"] for customer in customers] == [
         "CUST-000008",

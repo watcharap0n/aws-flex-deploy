@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import hashlib
+from collections import Counter
 import json
 import logging
 import os
@@ -142,6 +143,56 @@ def _integer_value(value: Any, field_name: str) -> int | None:
         raise ValueError(f"{field_name} must be an integer") from exc
 
 
+CUSTOMER_STATUSES = frozenset({"ACTIVE", "INACTIVE", "BLOCKED", "DELETED", "SUSPENDED", "PENDING"})
+# Source systems name statuses freely ("resigned", "ลาออก"). Common names map to
+# the canonical set; anything else stays ACTIVE with its text kept in attributes.
+STATUS_SYNONYMS = {
+    "ACTIVE": ("active", "enabled", "enable", "open", "current", "normal", "employed", "working",
+               "member", "yes", "y", "true", "1", "ใช้งาน", "ปกติ", "เปิด", "เปิดใช้งาน", "ทำงาน"),
+    "INACTIVE": ("inactive", "disabled", "disable", "closed", "close", "resigned", "resign",
+                 "terminated", "terminate", "left", "quit", "expired", "dormant", "churned", "no", "n",
+                 "false", "0", "ปิดใช้งาน", "ไม่ใช้งาน", "ลาออก", "พ้นสภาพ", "หมดอายุ", "ยกเลิก", "ปิด"),
+    "SUSPENDED": ("suspended", "suspend", "hold", "on hold", "frozen", "freeze", "ระงับ",
+                  "ระงับการใช้งาน", "พักการใช้งาน"),
+    "BLOCKED": ("blocked", "block", "banned", "ban", "blacklist", "blacklisted", "บล็อก", "แบน"),
+    "DELETED": ("deleted", "delete", "removed", "remove", "ลบ", "ลบแล้ว"),
+    "PENDING": ("pending", "waiting", "unverified", "awaiting", "รอ", "รอยืนยัน", "รออนุมัติ",
+                "รอดำเนินการ"),
+}
+_STATUS_LOOKUP = {name.casefold(): status for status, names in STATUS_SYNONYMS.items() for name in names}
+# Values the contract always accepted; they are not recorded as normalised.
+CANONICAL_STATUS_TEXT = {"ใช้งาน": "ACTIVE", "ปิดใช้งาน": "INACTIVE"}
+MAX_SOURCE_CUSTOMER_ID = 255
+
+
+def _normalise_status(value: Any) -> tuple[str, str]:
+    """(canonical status, 'canonical' | 'synonym' | 'unrecognised'). Blank stays ACTIVE."""
+    text = " ".join(str(value).split())
+    if not text:
+        return "ACTIVE", "canonical"
+    if text.upper() in CUSTOMER_STATUSES:
+        return text.upper(), "canonical"
+    if text in CANONICAL_STATUS_TEXT:
+        return CANONICAL_STATUS_TEXT[text], "canonical"
+    status = _STATUS_LOOKUP.get(text.casefold())
+    return (status, "synonym") if status else ("ACTIVE", "unrecognised")
+
+
+def _lenient(invalid: Dict[str, str], field: str, parse: Any, text: str, *args: Any) -> Any:
+    """A value that cannot be typed becomes NULL; its text is kept, never the row rejected."""
+    try:
+        return parse(text, *args)
+    except (TypeError, ValueError):
+        invalid[field] = text
+        return None
+
+
+def _bounded_source_customer_id(value: str) -> str:
+    if len(value) <= MAX_SOURCE_CUSTOMER_ID:
+        return value
+    return value[:200] + "#" + hashlib.sha256(value.encode()).hexdigest()[:32]
+
+
 def prepare_customers(
         csv_bytes: bytes,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -173,6 +224,8 @@ def prepare_customer_stream(binary_stream, customer_store=None):
     received = 0
     rejected = 0
     valid_count = 0
+    normalised_rows = 0
+    normalised_fields: Counter = Counter()
     customers_by_source_id = {} if customer_store is None else customer_store
     for input_row in reader:
         received += 1
@@ -190,29 +243,38 @@ def prepare_customer_stream(binary_stream, customer_store=None):
         }
         source_customer_id = _optional(row["source_customer_id"])
         if source_customer_id is None:
+            # Landing derives a key for every row; only a hand-made canonical file lacks one.
             rejected += 1
             continue
-        if len(source_customer_id) > 255:
-            rejected += 1
-            continue
-        try:
-            external_ids = _json_object(row["external_ids"], "external_ids")
-            attributes = _json_object(row["attributes"], "attributes")
-            date_of_birth = _date_value(row["date_of_birth"])
-            birthday = _date_value(row["birthday"])
-            age = _integer_value(row["age"], "age")
-            if age is not None and age < 0:
-                raise ValueError("age must be nonnegative")
-            status = {"ใช้งาน": "ACTIVE", "ปิดใช้งาน": "INACTIVE"}.get(
-                row["status"], _optional(row["status"].upper()) or "ACTIVE"
-            )
-            if status not in {"ACTIVE", "INACTIVE", "BLOCKED", "DELETED", "SUSPENDED", "PENDING"}:
-                raise ValueError("unsupported customer status")
-            source_created_at = _timestamp_value(row["source_created_at"])
-            source_updated_at = _timestamp_value(row["source_updated_at"])
-        except (TypeError, ValueError):
-            rejected += 1
-            continue
+        source_customer_id = _bounded_source_customer_id(source_customer_id)
+        # No row is rejected for a value: whatever cannot be typed is stored as
+        # NULL and its original text kept in attributes, so every file lands.
+        invalid: Dict[str, str] = {}
+        external_ids = _lenient(invalid, "external_ids", _json_object, row["external_ids"],
+                                "external_ids") or {}
+        attributes = _lenient(invalid, "attributes", _json_object, row["attributes"],
+                              "attributes") or {}
+        date_of_birth = _lenient(invalid, "date_of_birth", _date_value, row["date_of_birth"])
+        birthday = _lenient(invalid, "birthday", _date_value, row["birthday"])
+        age = _lenient(invalid, "age", _integer_value, row["age"], "age")
+        if age is not None and age < 0:
+            invalid["age"], age = row["age"], None
+        source_created_at = _lenient(invalid, "source_created_at", _timestamp_value,
+                                     row["source_created_at"])
+        source_updated_at = _lenient(invalid, "source_updated_at", _timestamp_value,
+                                     row["source_updated_at"])
+        status, status_kind = _normalise_status(row["status"])
+        status_changed = status_kind != "canonical"
+        if status_changed:
+            attributes["source_status"] = row["status"]
+            normalised_fields["status" if status_kind == "synonym" else "status_unrecognised"] += 1
+        if invalid:
+            if not isinstance(attributes.get("source_invalid_values"), dict):
+                attributes["source_invalid_values"] = {}
+            attributes["source_invalid_values"].update(invalid)
+            normalised_fields.update(invalid.keys())
+        if invalid or status_changed:
+            normalised_rows += 1
 
         devices = [
             item.strip()
@@ -290,6 +352,8 @@ def prepare_customer_stream(binary_stream, customer_store=None):
         "records_received": received,
         "records_rejected": rejected,
         "duplicate_rows": duplicates,
+        "records_normalised": normalised_rows,
+        "normalised_fields": dict(sorted(normalised_fields.items())),
     }
 
 
@@ -513,7 +577,7 @@ def _resolve_landing_lineage(
         raise ValueError("Landing metadata row-count must be an integer") from exc
     if metadata_rows != loaded_rows:
         raise ValueError(
-            "Landing metadata row-count does not match valid customer rows"
+            "Landing metadata row-count does not match the canonical rows read"
         )
 
     cursor.execute(
@@ -1002,7 +1066,9 @@ def _process_record(
                 source_code=source_code,
                 object_key=key,
                 checksum=checksum,
-                loaded_rows=len(customers),
+                # Landing counts canonical rows; a row this parser drops is reported
+                # in records_rejected, never a reason to fail the whole file.
+                loaded_rows=stats["records_received"],
             )
 
             if (os.getenv('CUSTOMER_FORWARD_SOURCE_NAMESPACE_ENABLED', 'false').lower() == 'true'
