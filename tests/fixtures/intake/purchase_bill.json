@@ -1,0 +1,37 @@
+{
+ "version": 2,
+ "template": "retail.purchase_bill.v1",
+ "derived_keys": {
+  "buyer": {"first_of": [
+   {"id_type": "member", "source_path": "รหัสสมาชิก", "transforms": ["trim", "uppercase"]},
+   {"id_type": "phone", "source_path": "เบอร์มือถือ", "transforms": ["th_mobile"]}
+  ]}
+ },
+ "projections": [
+  {"name": "customer", "target_entity": "CUSTOMER", "when_present": ["buyer"], "fields": [
+   {"target_field": "source_customer_id", "derived_key": "buyer"},
+   {"target_field": "member_code", "source_path": "รหัสสมาชิก", "transforms": ["trim", "uppercase"]},
+   {"target_field": "full_name", "source_path": "ชื่อลูกค้า", "transforms": ["trim"]},
+   {"target_field": "phone", "source_path": "เบอร์มือถือ", "transforms": ["th_mobile"]}
+  ]},
+  {"name": "purchase", "target_entity": "TRANSACTION", "when_present": ["เลขที่บิล"], "fields": [
+   {"target_field": "source_transaction_id", "source_path": "เลขที่บิล", "transforms": ["trim"]},
+   {"target_field": "source_customer_id", "derived_key": "buyer"},
+   {"target_field": "transaction_type", "constant": "purchase"},
+   {"target_field": "status", "source_path": "สถานะ", "transforms": ["trim", "lowercase"]},
+   {"target_field": "occurred_at", "source_path": "วันที่ขาย", "transforms": ["parse_timestamp"]},
+   {"target_field": "amount", "source_path": "ยอดสุทธิ", "transforms": ["to_number"]},
+   {"target_field": "currency", "constant": "THB"},
+   {"target_field": "discount_amount", "source_path": "ส่วนลด", "transforms": ["to_number"]},
+   {"target_field": "quantity", "source_path": "จำนวนชิ้น", "transforms": ["to_number"]},
+   {"target_field": "channel", "source_path": "ช่องทาง", "transforms": ["trim", "lowercase"]},
+   {"target_field": "location_id", "source_path": "รหัสสาขา", "transforms": ["trim"]},
+   {"target_field": "items", "pack": [{"path": "รายการสินค้า", "as": "lines", "transforms": ["trim"]}]},
+   {"target_field": "attributes", "pack": [
+    {"path": "วิธีชำระ", "as": "payment_method", "transforms": ["trim"]},
+    {"path": "ยอดก่อนลด", "as": "gross_amount", "transforms": ["to_number"]},
+    {"path": "รหัสโปรโมชั่น", "as": "promotion_code", "transforms": ["trim"]}
+   ]}
+  ]}
+ ]
+}

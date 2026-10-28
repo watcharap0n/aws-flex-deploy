@@ -207,6 +207,7 @@ class SourceObject:
     file_format: str
     event_version_id: str | None
     event_etag: str | None = None
+    dataset_id: str | None = None  # intake v2: data_sources/<src>/<batch>/datasets/<id>/<file>
 
 
 @dataclass(frozen=True)
@@ -328,6 +329,26 @@ def _source_from_record(
 
     relative_key = key[len(config.input_prefix):]
     parts = relative_key.split("/")
+    if len(parts) == 5 and parts[2] == "datasets" and all(parts):
+        # Intake v2 upload dataset; the customer route below is untouched.
+        from intake_projection import parse_dataset_parts
+
+        source_code, batch_ref, dataset_id, _filename = parse_dataset_parts(parts)
+        if not SOURCE_CODE_PATTERN.fullmatch(source_code):
+            raise ValueError("source_code must be lowercase a-z, 0-9, underscore or hyphen")
+        if not BATCH_REF_PATTERN.fullmatch(batch_ref):
+            raise ValueError("batch_ref must be lowercase a-z, 0-9, dot, underscore or hyphen")
+        return SourceObject(
+            bucket=bucket,
+            key=key,
+            source_code=source_code,
+            batch_ref=batch_ref,
+            source_type="datasets",
+            file_format=file_format,
+            event_version_id=object_data.get("versionId"),
+            event_etag=object_data.get("eTag"),
+            dataset_id=dataset_id,
+        )
     if len(parts) != 4 or any(not part for part in parts):
         raise ValueError(
             "S3 key must be "
@@ -2002,6 +2023,41 @@ def _process_source_locked(
     return source_result
 
 
+def _process_dataset_sources(sources: list[SourceObject], config: Config) -> list[dict[str, Any]]:
+    """Intake v2: project each uploaded dataset file (see intake_projection.py)."""
+    import intake_projection
+
+    results: list[dict[str, Any]] = []
+    secret = _get_secret(config.db_secret_id)
+    connection = _database_connection(secret)
+    s3_client = boto3.client("s3")
+    try:
+        sink = intake_projection.ClickHouseSink(
+            _get_secret(_required_environment("INTAKE_CLICKHOUSE_SECRET_ID")))
+        hmac_secret = str(_secret_value(
+            _get_secret(_required_environment("INTAKE_HMAC_SECRET_ID")), "key")).encode()
+        for source in sources:
+            downloaded = None
+            try:
+                downloaded = _download_object(s3_client, source)
+                results.append(intake_projection.process_dataset_object(
+                    source=source, downloaded=downloaded, connection=connection,
+                    s3_client=s3_client, output_bucket=config.output_bucket or source.bucket,
+                    output_root_prefix=config.output_root_prefix,
+                    input_prefix=config.input_prefix, customer_columns=CSV_COLUMNS,
+                    hmac_secret=hmac_secret, sink=sink))
+            except (intake_projection.DatasetObjectError, SourceConflictError) as exc:
+                connection.rollback()
+                LOGGER.warning("intake_dataset_rejected key=%s reason=%s", source.key, exc)
+                results.append({"status": "rejected", "key": source.key, "reason": str(exc)})
+            finally:
+                if downloaded is not None:
+                    downloaded.__exit__(None, None, None)
+    finally:
+        connection.close()
+    return results
+
+
 def lambda_handler(event: Mapping[str, Any], context: Any) -> dict[str, Any]:
     request_id = getattr(context, "aws_request_id", "unknown")
     event_records = event.get("Records", [])
@@ -2049,6 +2105,15 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> dict[str, Any]:
         len(sources),
         len(rejected),
     )
+    dataset_sources = [source for source in sources if source.source_type == "datasets"]
+    if dataset_sources:
+        rejected = rejected + _process_dataset_sources(dataset_sources, config)
+        kept = [(s, r) for s, r in zip(sources, accepted_records) if s.source_type != "datasets"]
+        sources = [s for s, _ in kept]
+        accepted_records = [r for _, r in kept]
+        if not sources:
+            return {"status": "completed", "processed_records": len(dataset_sources),
+                    "results": rejected}
     if os.getenv('CUSTOMER_LANDING_ENABLED', 'false').lower() == 'true':
         # ACK only after each job is committed to the durable outbox. A later
         # failure retries the event; enqueue's S3 identity is idempotent.
