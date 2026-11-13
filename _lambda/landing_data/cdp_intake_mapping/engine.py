@@ -13,6 +13,15 @@ Each field has `target_field` and exactly one value source:
 plus optional `transforms` (applied to source_path / template parts).
 Projection conditions: `when_present` (all refs present) and `when_any_present` (at least one);
 a ref is a source path or a derived key name.
+
+Grouped projections (line-level files): a TRANSACTION projection with `"group_by":
+"source_transaction_id"` emits one header candidate per row; the landing builds one bill per key
+(header from the first row, totals summed from the TRANSACTION_ITEM records of the same rows when
+the file has no bill total). `amount` may then be left unmapped.
+
+Row-local fixes applied to every record (`finish_record`): canonical values for movement types,
+coupon statuses and consent statuses (raw text kept in attributes), signed point movements, derived
+movement / wallet ids, line net from price x quantity, and defaults (program, channel, origin).
 """
 
 from __future__ import annotations
@@ -23,7 +32,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .contracts import ENTITY_FIELDS, ENTITY_KEY, ENTITY_REQUIRED, JSON_FIELDS, NODE_TYPES
+from .contracts import (CANONICAL_VALUES, ENTITY_FIELDS, ENTITY_KEY, ENTITY_REQUIRED, JSON_FIELDS,
+                        NODE_TYPES)
 from .transforms import TransformError, Transforms, clean
 
 VALUE_SOURCES = ("source_path", "constant", "derived_key", "template", "pack", "coalesce")
@@ -130,13 +140,108 @@ def validate_mapping(mapping: dict, transforms: Transforms | None = None) -> lis
                                       names)
         if len(set(targets)) != len(targets):
             errors.append(f"{pname}: target_field values must be unique")
+        group_by = proj.get("group_by")
+        if group_by is not None:
+            if entity != "TRANSACTION" or group_by != "source_transaction_id":
+                errors.append(f"{pname}: group_by is only for TRANSACTION on source_transaction_id")
+            elif not any(p.get("target_entity") == "TRANSACTION_ITEM" for p in projections):
+                errors.append(f"{pname}: group_by needs a TRANSACTION_ITEM projection for the lines")
         unsupported = sorted(set(targets) - ENTITY_FIELDS[entity])
         if unsupported:
             errors.append(f"{pname}: unsupported {entity.lower()} fields {unsupported}")
-        for group in ENTITY_REQUIRED[entity]:
+        for group in required_groups(proj):
             if not set(targets) & set(group):
                 errors.append(f"{pname}: {entity.lower()} requires {' or '.join(group)}")
     return errors
+
+
+# A grouped bill can take its total from its lines, so amount is optional there.
+LINE_TOTALS = frozenset({"amount", "quantity", "discount_amount"})
+
+
+def required_groups(proj: dict) -> tuple:
+    groups = ENTITY_REQUIRED[proj["target_entity"]]
+    if proj.get("group_by"):
+        return tuple(g for g in groups if not set(g) <= LINE_TOTALS)
+    return groups
+
+
+def _canon_lookup() -> dict:
+    out = {}
+    for key, values in CANONICAL_VALUES.items():
+        out[key] = {name.casefold(): canon for canon, names in values.items() for name in names}
+        out[key].update({canon: canon for canon in values})
+    return out
+
+
+_CANON = _canon_lookup()
+_NEGATIVE_MOVES = frozenset({"burn", "expire"})
+
+
+def _digest(*parts: Any) -> str:
+    text = "|".join("" if p is None else str(p) for p in parts)
+    return hashlib.sha256(text.encode()).hexdigest()[:32]
+
+
+def _attrs(record: dict) -> dict:
+    raw = record.get("attributes")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw else {}
+        except ValueError:
+            raw = {"_attributes": raw}
+    return dict(raw or {})
+
+
+def _dec(value: Any):
+    from decimal import Decimal, InvalidOperation
+    try:
+        return None if value in (None, "") else Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def finish_record(entity: str, record: dict) -> None:
+    """Row-local rules shared by upload and connector (see the module docstring)."""
+    for (ent, fld), lookup in _CANON.items():
+        if ent != entity or record.get(fld) in (None, ""):
+            continue
+        raw = " ".join(str(record[fld]).split())
+        canon = lookup.get(raw.casefold())
+        if canon != raw:
+            attrs = _attrs(record)
+            attrs[f"{fld}_raw"] = raw
+            record["attributes"] = attrs
+        record[fld] = canon or "unknown"
+    if entity == "POINT_LEDGER":
+        points = _dec(record.get("points"))
+        if points is not None and points > 0 and record.get("movement_type") in _NEGATIVE_MOVES:
+            record["points"] = str(-points)
+        record.setdefault("program", "default")
+        if not record.get("source_movement_id"):
+            record["source_movement_id"] = _digest(
+                record.get("source_customer_id"), record.get("occurred_at"),
+                record.get("movement_type"), record.get("points"),
+                record.get("source_transaction_id"), record.get("program"))
+    elif entity == "POINT_BALANCE":
+        record.setdefault("program", "default")
+    elif entity == "COUPON_WALLET":
+        if not record.get("source_wallet_id"):
+            record["source_wallet_id"] = _digest(
+                record.get("source_coupon_id"), record.get("source_customer_id"),
+                record.get("coupon_code") or record.get("issued_at"))
+    elif entity == "CONSENT":
+        record.setdefault("channel", "all")
+        record["purpose"] = str(record["purpose"]).strip().lower().replace(" ", "_")
+        record["channel"] = str(record["channel"]).strip().lower()
+    elif entity in ("PRODUCT", "STORE"):
+        record.setdefault("origin", "master")
+    elif entity == "TRANSACTION_ITEM" and record.get("net_amount") in (None, ""):
+        price, qty = _dec(record.get("unit_price")), _dec(record.get("quantity"))
+        if price is not None and qty is not None:
+            net = price * qty - (_dec(record.get("discount_amount")) or 0)
+            text = format(net, "f")
+            record["net_amount"] = text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _spec_paths(spec: dict) -> set[str]:
@@ -188,6 +293,7 @@ class ProjectionResult:
 
 REQUIRED_FIELDS = {entity: frozenset(f for group in groups for f in group) | {"source_customer_id"}
                    for entity, groups in ENTITY_REQUIRED.items()}
+REQUIRED_FIELDS["TRANSACTION_ITEM"] |= {"line_no"}
 
 
 class Projector:
@@ -312,7 +418,7 @@ class Projector:
                     edge = "|".join(str(record[k]) for k in EDGE_FIELDS)
                     digest = hashlib.sha256(edge.encode()).hexdigest()
                     record["source_relationship_id"] = digest[:32]
-            missing = [" or ".join(group) for group in ENTITY_REQUIRED[entity]
+            missing = [" or ".join(group) for group in required_groups(proj)
                        if not any(record.get(k) not in (None, "") for k in group)]
             if missing or problems:
                 result.rejects.append({"projection": name, "target_entity": entity,
@@ -322,6 +428,7 @@ class Projector:
             if dropped:
                 result.warnings.append({"projection": name, "target_entity": entity,
                                         "row_number": row_number, "dropped": dropped})
+            finish_record(entity, record)
             for json_field in JSON_FIELDS & record.keys():
                 if not isinstance(record[json_field], str):
                     record[json_field] = json.dumps(record[json_field], ensure_ascii=False,

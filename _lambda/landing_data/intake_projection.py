@@ -45,9 +45,10 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from decimal import Decimal
 from typing import Any
 
-from cdp_intake_mapping import Projector, Transforms, normalize_headers
+from cdp_intake_mapping import ENTITY_KEY, MASTER_ENTITIES, Projector, Transforms, normalize_headers
 from person_observation import ObservationWriter
 
 LOGGER = logging.getLogger()
@@ -56,6 +57,53 @@ FACT_ENTITIES = ("TRANSACTION", "EVENT", "ASSET", "RELATIONSHIP")
 BATCH_REF_APP = re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{6})-(\d+)-([0-9a-f]{12})$")
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 LINEAGE = ("app_id", "source_code", "dataset_id", "batch_ref", "mapping_version_id", "_version")
+# Master rows (a brand's own product/store/campaign/coupon list) outrank rows only seen on bills:
+# FINAL keeps the highest _version, and a master row's version carries this bit.
+MASTER_RANK = 1 << 62
+# Database connectors land their extract on the dataset path too; the projection is the same.
+CONNECTOR_ENGINES = frozenset({"postgresql", "mysql", "mariadb", "mongodb", "azure_sql"})
+# Line-level files: bill header candidates and lines are staged, then built per file in ClickHouse
+# (header = first line, totals = sum of lines when the file has no bill total, line_no derived per
+# product when the file has none), so the Lambda keeps no per-bill state.
+STAGE_TABLE = {"TRANSACTION": "TRANSACTION_STAGE", "TRANSACTION_ITEM": "TRANSACTION_ITEM_STAGE"}
+_WHERE = ("dataset_id = toUUID('{dataset_id}') AND batch_ref = '{batch_ref}' "
+          "AND _version = {version}")
+ITEM_FINALIZE_SQL = (
+    "INSERT INTO cdp_intake.transaction_item (app_id, source_code, dataset_id, batch_ref, "
+    "mapping_version_id, source_transaction_id, line_no, source_customer_id, occurred_at, location_id, "
+    "sku, product_name, category, category_path, brand, quantity, unit_price, discount_amount, "
+    "net_amount, currency, attributes, _projection, _version) "
+    "SELECT app_id, source_code, dataset_id, batch_ref, mapping_version_id, source_transaction_id, "
+    "if(given_line != '', given_line, concat(product_key, '#', toString(row_number() OVER "
+    "(PARTITION BY source_transaction_id, product_key ORDER BY _row)))) AS line_no, "
+    "source_customer_id, occurred_at, location_id, sku, product_name, category, category_path, brand, "
+    "quantity, unit_price, discount_amount, net_amount, currency, attributes, _projection, _version "
+    "FROM (SELECT app_id, source_code, dataset_id, batch_ref, mapping_version_id, "
+    "source_transaction_id, line_no AS given_line, ifNull(sku, ifNull(product_name, '')) AS product_key, "
+    "_row, source_customer_id, occurred_at, location_id, sku, product_name, category, category_path, "
+    "brand, quantity, unit_price, discount_amount, net_amount, currency, attributes, _projection, "
+    "_version FROM cdp_intake.transaction_item_stage WHERE " + _WHERE + ")")
+BILL_FINALIZE_SQL = (
+    "INSERT INTO cdp_intake.transaction (app_id, source_code, dataset_id, batch_ref, "
+    "mapping_version_id, source_transaction_id, source_customer_id, transaction_type, status, "
+    "occurred_at, amount, currency, discount_amount, quantity, channel, location_id, items, attributes, "
+    "source_updated_at, original_transaction_id, line_count, amount_from, _projection, _version) "
+    "SELECT app_id, source_code, dataset_id, batch_ref, mapping_version_id, source_transaction_id, "
+    "argMin(source_customer_id, _row), argMin(transaction_type, _row), argMin(status, _row), "
+    "argMin(occurred_at, _row), "
+    "toDecimal64(ifNull(if(count(amount) > 0, argMin(amount, _row), sum(_line_net)), 0), 4), "
+    "argMin(currency, _row), "
+    "if(count(discount_amount) > 0, argMin(discount_amount, _row), sum(_line_disc)), "
+    "if(count(quantity) > 0, argMin(quantity, _row), sum(_line_qty)), "
+    "argMin(channel, _row), argMin(location_id, _row), argMin(items, _row), argMin(attributes, _row), "
+    "argMin(source_updated_at, _row), argMin(original_transaction_id, _row), toUInt32(count()), "
+    "if(count(amount) > 0, 'file', 'lines'), any(_projection), any(_version) "
+    "FROM cdp_intake.transaction_stage WHERE " + _WHERE + " "
+    "GROUP BY app_id, source_code, dataset_id, batch_ref, mapping_version_id, source_transaction_id")
+STAGED_BILLS_SQL = ("SELECT uniqExact(source_transaction_id) FROM cdp_intake.transaction_stage "
+                    "WHERE " + _WHERE)
+LINE_SUMS = (("_line_net", "net_amount"), ("_line_qty", "quantity"), ("_line_disc", "discount_amount"))
+HEADER_TO_LINE = ("source_customer_id", "occurred_at", "location_id")
 FACT_COLUMNS = {
     "TRANSACTION": ("source_transaction_id", "source_customer_id", "transaction_type", "status",
                     "occurred_at", "amount", "currency", "discount_amount", "quantity", "channel",
@@ -419,9 +467,17 @@ class ClickHouseSink:
         if body:
             self._post(f"INSERT INTO cdp_intake.{entity.lower()} FORMAT JSONEachRow", body)
 
-    def count(self, entity: str, dataset_id: str, batch_ref: str, version: int) -> int:
+    def count(self, entity: str, dataset_id: str, batch_ref: str, version: int,
+              versions: tuple[int, ...] = ()) -> int:
+        wanted = ", ".join(str(v) for v in (version, *versions))
         query = (f"SELECT count() FROM cdp_intake.{entity.lower()} WHERE dataset_id = "
-                 f"toUUID('{dataset_id}') AND batch_ref = '{batch_ref}' AND _version = {version}")
+                 f"toUUID('{dataset_id}') AND batch_ref = '{batch_ref}' AND _version IN ({wanted})")
+        return int(self._post(query + " FORMAT TSVRaw").strip() or 0)
+
+    def run(self, query: str) -> str:
+        return self._post(query)
+
+    def scalar(self, query: str) -> int:
         return int(self._post(query + " FORMAT TSVRaw").strip() or 0)
 
 
@@ -454,8 +510,8 @@ def process_dataset_object(
 ) -> dict[str, Any]:
     with connection.cursor() as cursor:
         ctx = load_context(cursor, source.dataset_id)
-    if ctx["definition_key"] != "file_upload":
-        raise DatasetObjectError("dataset does not belong to a file_upload connection")
+    if ctx["definition_key"] != "file_upload" and ctx["definition_key"] not in CONNECTOR_ENGINES:
+        raise DatasetObjectError("dataset does not belong to a file upload or database connection")
     if ctx["source_code"] != source.source_code:
         raise DatasetObjectError("source_code in the path does not match the dataset connection")
     if not ctx["app_id"] or batch_app_id(source.batch_ref) != str(ctx["app_id"]):
@@ -471,6 +527,10 @@ def process_dataset_object(
     entity_of = {p["name"]: p["target_entity"] for p in mapping["projections"]}
     entities = sorted(set(entity_of.values()))
     facts = [e for e in entities if e != "CUSTOMER"]
+    grouped = any(p.get("group_by") for p in mapping["projections"])
+    staged = {e for e in facts if e == "TRANSACTION_ITEM" or (e == "TRANSACTION" and grouped)}
+    table = {e: STAGE_TABLE[e] if e in staged else e for e in facts}
+    observed_seen: dict[str, set[str]] = {e: set() for e in facts if e in MASTER_ENTITIES}
     raw_prefix = (f"{output_root_prefix}{source.source_code}/intake/{source.batch_ref}/"
                   f"{ctx['dataset_id']}/")
     lineage = {"app_id": str(ctx["app_id"]), "source_code": source.source_code,
@@ -498,7 +558,7 @@ def process_dataset_object(
         body = bytes(buffers[entity])
         buffers[entity] = bytearray()
         if body and entity not in errors:
-            inserts[entity].append(pool.submit(sink.insert_ndjson, entity, body))
+            inserts[entity].append(pool.submit(sink.insert_ndjson, table[entity], body))
             writers[entity].write(body)
 
     def note(item: dict[str, Any]) -> None:
@@ -525,6 +585,7 @@ def process_dataset_object(
                 warned_rows += 1
                 for warning in result.warnings:
                     note(dict(warning, kind="value_dropped"))
+            stage_row(result.records, row_number, "TRANSACTION" in staged)
             for entity, records in result.records.items():
                 if entity == "CUSTOMER":
                     for record in records:
@@ -532,7 +593,16 @@ def process_dataset_object(
                     continue
                 buf = buffers[entity]
                 for record in records:
-                    buf += (json.dumps(dict(record, **lineage), ensure_ascii=False) + "\n").encode()
+                    row_lineage = lineage
+                    if entity in MASTER_ENTITIES:
+                        if record.get("origin") == "observed":
+                            key = str(record.get(ENTITY_KEY[entity]))
+                            if key in observed_seen[entity]:
+                                continue
+                            observed_seen[entity].add(key)
+                        else:
+                            row_lineage = dict(lineage, _version=version + MASTER_RANK)
+                    buf += (json.dumps(dict(record, **row_lineage), ensure_ascii=False) + "\n").encode()
                     written[entity] += 1
                 if len(buf) >= chunk_bytes:
                     flush(entity)
@@ -540,6 +610,22 @@ def process_dataset_object(
         parsed = clock()
         for entity in facts:
             flush(entity)
+
+        finalize_error: dict[str, BaseException] = {}
+        bills_expected = 0
+        if staged:
+            where = {"dataset_id": ctx["dataset_id"], "batch_ref": source.batch_ref, "version": version}
+            try:
+                for entity in staged:
+                    for future in inserts[entity]:
+                        future.result()
+                if written.get("TRANSACTION_ITEM"):
+                    sink.run(ITEM_FINALIZE_SQL.format(**where))
+                if "TRANSACTION" in staged and written.get("TRANSACTION"):
+                    bills_expected = sink.scalar(STAGED_BILLS_SQL.format(**where))
+                    sink.run(BILL_FINALIZE_SQL.format(**where))
+            except Exception as exc:  # reported per output below
+                finalize_error.update({e: exc for e in staged})
 
         outputs = []
         with connection.cursor() as cursor:
@@ -562,11 +648,16 @@ def process_dataset_object(
                         for future in inserts[entity]:
                             future.result()
                         writers[entity].close()
+                        if entity in finalize_error:
+                            raise finalize_error[entity]
+                        expected = bills_expected if entity == "TRANSACTION" and entity in staged \
+                            else written[entity]
                         if written[entity]:
-                            loaded = sink.count(entity, ctx["dataset_id"], source.batch_ref, version)
-                            if loaded != written[entity]:
-                                raise RuntimeError(f"ClickHouse has {loaded} of {written[entity]} rows")
-                        status.update(route="cdp_intake", status="LOADED", output_rows=written[entity],
+                            extra = (version + MASTER_RANK,) if entity in MASTER_ENTITIES else ()
+                            loaded = sink.count(entity, ctx["dataset_id"], source.batch_ref, version, extra)
+                            if loaded != expected:
+                                raise RuntimeError(f"ClickHouse has {loaded} of {expected} rows")
+                        status.update(route="cdp_intake", status="LOADED", output_rows=expected,
                                       output_key=writers[entity].key)
                 except Exception as exc:
                     if entity != "CUSTOMER":
@@ -602,6 +693,30 @@ def process_dataset_object(
             "source_code": source.source_code, "batch_ref": source.batch_ref,
             "dataset_id": ctx["dataset_id"], "source_rows": source_rows, "warned_rows": warned_rows,
             "columns": len(headers), "outputs": outputs}
+
+
+def stage_row(records: dict[str, list[dict[str, Any]]], row_number: int, bills_staged: bool) -> None:
+    """Tag the row's bill header and lines with the row number; give the header the row's line
+    totals and the lines the header's customer, time and store (one POS row = one line)."""
+    lines = records.get("TRANSACTION_ITEM") or []
+    for line in lines:
+        line["_row"] = row_number
+    bills = records.get("TRANSACTION") or []
+    if not bills_staged or not bills:
+        return
+    for stage_field, line_field in LINE_SUMS:
+        values = [Decimal(str(x[line_field])) for x in lines if x.get(line_field) not in (None, "")]
+        if values:
+            total = sum(values, Decimal(0))
+            for bill in bills:
+                bill[stage_field] = str(total)
+    header = bills[0]
+    for bill in bills:
+        bill["_row"] = row_number
+    for line in lines:
+        for field in HEADER_TO_LINE:
+            if line.get(field) in (None, "") and header.get(field) not in (None, ""):
+                line[field] = header[field]
 
 
 def reject_summary(rows: int, reasons: dict[str, int], top: int = 3) -> str:

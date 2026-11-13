@@ -145,8 +145,41 @@ class _Sink:
     def insert_ndjson(self, entity, body):
         self.rows.setdefault(entity, []).extend(json.loads(line) for line in body.decode().splitlines())
 
-    def count(self, entity, dataset_id, batch_ref, version):
-        return len([r for r in self.rows.get(entity, []) if r["_version"] == version])
+    def count(self, entity, dataset_id, batch_ref, version, versions=()):
+        wanted = {version, *versions}
+        return len([r for r in self.rows.get(entity, []) if r["_version"] in wanted])
+
+    # The finalize SQL runs in ClickHouse; this mirrors it for unit tests (the SQL itself is checked
+    # against a real ClickHouse in the stg E2E).
+    def scalar(self, query):
+        return len({r["source_transaction_id"] for r in self.rows.get("TRANSACTION_STAGE", [])})
+
+    def run(self, query):
+        from decimal import Decimal
+        if "INSERT INTO cdp_intake.transaction_item " in query:
+            seen = {}
+            for r in sorted(self.rows.get("TRANSACTION_ITEM_STAGE", []), key=lambda x: x["_row"]):
+                product = r.get("sku") or r.get("product_name") or ""
+                n = seen[(r["source_transaction_id"], product)] = seen.get((r["source_transaction_id"], product), 0) + 1
+                out = {k: v for k, v in r.items() if k != "_row"}
+                out["line_no"] = r.get("line_no") or f"{product}#{n}"
+                self.rows.setdefault("TRANSACTION_ITEM", []).append(out)
+            return ""
+        bills = {}
+        for r in sorted(self.rows.get("TRANSACTION_STAGE", []), key=lambda x: x["_row"]):
+            b = bills.setdefault(r["source_transaction_id"], {"rows": []})
+            b["rows"].append(r)
+        for key, b in bills.items():
+            first = dict(b["rows"][0])
+            given = [r["amount"] for r in b["rows"] if r.get("amount") not in (None, "")]
+            lines = sum((Decimal(r["_line_net"]) for r in b["rows"] if r.get("_line_net")), Decimal(0))
+            first["amount"] = given[0] if given else str(lines)
+            first["amount_from"] = "file" if given else "lines"
+            first["line_count"] = len(b["rows"])
+            for k in ("_row", "_line_net", "_line_qty", "_line_disc"):
+                first.pop(k, None)
+            self.rows.setdefault("TRANSACTION", []).append(first)
+        return ""
 
 
 def _run(intake, landing, app_id="990008", definition_key="file_upload", body=None, mapping=None):
@@ -204,8 +237,9 @@ def test_purchase_upload_splits_into_customers_and_transactions(intake, landing)
 def test_wrong_app_or_connection_is_rejected(intake, landing):
     with pytest.raises(intake.DatasetObjectError, match="app id"):
         _run(intake, landing, app_id="43")
-    with pytest.raises(intake.DatasetObjectError, match="file_upload"):
-        _run(intake, landing, definition_key="postgresql")
+    # Database connections land on the dataset path too (mapping v2); unknown engines do not.
+    with pytest.raises(intake.DatasetObjectError, match="file upload or database"):
+        _run(intake, landing, definition_key="rest_api")
 
 
 def test_clickhouse_insert_is_chunked_under_the_body_cap(intake, monkeypatch):
@@ -333,3 +367,71 @@ def test_related_observations_include_keyless_names_and_hash_identity_tokens(int
     record = list(observations(projector, row, result, {}, 1))[0]
     assert 'sensitive-identity' not in record['payload']
     assert json.loads(record['payload'])['customer']['full_name'] == 'Keyless Person'
+
+
+LINES_CSV = """bill_no,sold_at,member,store,sku,product,category,qty,price,net
+B1,2026-11-01 10:00,m1,S01,P1,Pen,Stationery,2,15,30
+B1,2026-11-01 10:00,m1,S01,P2,Notebook,Stationery,1,45,45
+B1,2026-11-01 10:00,m1,S01,P1,Pen,Stationery,1,15,15
+B2,2026-11-02 11:00,m2,S02,P3,Charger,Electronics,1,590,
+B3,2026-11-03 12:00,,S01,P2,Notebook,Stationery,3,45,135
+""".encode()
+
+
+def _lines_mapping():
+    f = lambda t, path=None, tf=None, **kw: dict({"target_field": t, **({"source_path": path} if path else {}),
+                                                   **({"transforms": tf} if tf else {})}, **kw)
+    return {"version": 2,
+            "derived_keys": {"member": {"first_of": [{"id_type": "member", "source_path": "member",
+                                                      "transforms": ["trim", "uppercase"]}]}},
+            "projections": [
+                {"name": "bill", "target_entity": "TRANSACTION", "group_by": "source_transaction_id",
+                 "fields": [f("source_transaction_id", "bill_no"), f("source_customer_id", derived_key="member"),
+                            f("transaction_type", constant="purchase"),
+                            f("occurred_at", "sold_at", ["parse_timestamp"]), f("location_id", "store"),
+                            f("currency", constant="THB")]},
+                {"name": "line", "target_entity": "TRANSACTION_ITEM",
+                 "fields": [f("source_transaction_id", "bill_no"), f("sku", "sku"), f("product_name", "product"),
+                            f("category", "category"), f("quantity", "qty", ["to_number"]),
+                            f("unit_price", "price", ["to_number"]), f("net_amount", "net", ["to_number"])]},
+                {"name": "product_seen", "target_entity": "PRODUCT", "when_present": ["sku"],
+                 "fields": [f("sku", "sku"), f("name", "product"), f("category", "category"),
+                            f("origin", constant="observed")]},
+                {"name": "store_seen", "target_entity": "STORE", "when_present": ["store"],
+                 "fields": [f("store_code", "store"), f("origin", constant="observed")]}]}
+
+
+def test_line_level_file_keeps_every_line_and_builds_bills(intake, landing):
+    result, conn, s3, sink = _run(intake, landing, body=LINES_CSV, mapping=_lines_mapping())
+    assert result["status"] == "intake_processed", result
+    outputs = {o["target_entity"]: o for o in result["outputs"]}
+    # 5 lines stay 5 lines; before the fix the bill table kept one row per bill only.
+    assert outputs["TRANSACTION_ITEM"]["output_rows"] == 5
+    assert outputs["TRANSACTION"]["output_rows"] == 3
+    bills = {b["source_transaction_id"]: b for b in sink.rows["TRANSACTION"]}
+    assert bills["B1"]["amount"] == "90" and bills["B1"]["amount_from"] == "lines"
+    assert bills["B1"]["line_count"] == 3 and bills["B1"]["source_customer_id"] == "member:M1"
+    assert bills["B2"]["amount"] == "590"  # net missing: price x qty
+    assert "source_customer_id" not in bills["B3"]  # anonymous bill kept, not attached
+    lines = [r for r in sink.rows["TRANSACTION_ITEM"] if r["source_transaction_id"] == "B1"]
+    assert sorted(r["line_no"] for r in lines) == ["P1#1", "P1#2", "P2#1"]
+    assert all(r["source_customer_id"] == "member:M1" and r["location_id"] == "S01" for r in lines)
+    # Observed masters: one row per product/store per file, plain version (masters outrank them).
+    assert sorted(r["sku"] for r in sink.rows["PRODUCT"]) == ["P1", "P2", "P3"]
+    assert sorted(r["store_code"] for r in sink.rows["STORE"]) == ["S01", "S02"]
+    assert all(r["_version"] < intake.MASTER_RANK for r in sink.rows["PRODUCT"])
+
+
+def test_master_rows_outrank_observed(intake, landing):
+    mapping = {"version": 2, "projections": [{"name": "catalog", "target_entity": "PRODUCT", "fields": [
+        {"target_field": "sku", "source_path": "sku"}, {"target_field": "name", "source_path": "name"}]}]}
+    result, conn, s3, sink = _run(intake, landing, body=b"sku,name\nP1,Gel pen 0.5\n", mapping=mapping)
+    assert result["status"] == "intake_processed", result
+    assert sink.rows["PRODUCT"][0]["_version"] >= intake.MASTER_RANK
+    assert sink.rows["PRODUCT"][0]["origin"] == "master"
+
+
+def test_connector_dataset_with_mapping_v2_is_accepted(intake, landing):
+    result, conn, s3, sink = _run(intake, landing, definition_key="mongodb", body=LINES_CSV,
+                                  mapping=_lines_mapping())
+    assert result["status"] == "intake_processed"
