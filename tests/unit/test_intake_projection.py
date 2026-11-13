@@ -14,11 +14,9 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LANDING_DIR = PROJECT_ROOT / "_lambda" / "landing_data"
-# Copies of buzz-cdp-workspace packages/cdp-intake-mapping samples/purchase_bill_sample.csv and
-# templates/retail/purchase_bill.json, so this repo's tests do not need a sibling checkout.
-FIXTURES = PROJECT_ROOT / "tests" / "fixtures" / "intake"
-SAMPLE = FIXTURES / "purchase_bill_sample.csv"
-TEMPLATE = FIXTURES / "purchase_bill.json"
+LIB_ROOT = PROJECT_ROOT.parent / "buzz-cdp-workspace" / "packages" / "cdp-intake-mapping"
+SAMPLE = LIB_ROOT / "samples" / "purchase_bill_sample.csv"
+TEMPLATE = LIB_ROOT / "templates" / "retail" / "purchase_bill.json"
 DATASET_ID = "0b6eee51-1704-4a69-942f-a19853092b80"
 BATCH_REF = "2026-10-22-101500-990008-0123456789ab"
 
@@ -288,7 +286,50 @@ def test_customers_all_rejected_fail_without_a_handoff(intake, landing):
 def test_reads_the_handlers_spooled_download(intake, spool_max):
     """The handler hands over a SpooledTemporaryFile (in memory or rolled to disk)."""
     import tempfile
-    with tempfile.SpooledTemporaryFile(max_size=spool_max, mode="w+b") as content:
-        content.write(SAMPLE.read_bytes())
-        headers, rows = intake.iter_rows(content, "csv")
-        assert len(list(rows)) == 8 and headers
+    content = tempfile.SpooledTemporaryFile(max_size=spool_max, mode="w+b")
+    content.write(SAMPLE.read_bytes())
+    headers, rows = intake.iter_rows(content, "csv")
+    assert len(list(rows)) == 8 and headers
+
+
+def test_related_sidecar_keeps_customer_csv_and_statuses_byte_identical(intake, landing, monkeypatch):
+    monkeypatch.delenv('RELATED_OBSERVATIONS_ENABLED', raising=False)
+    before = _run(intake, landing)
+    monkeypatch.setenv('RELATED_OBSERVATIONS_ENABLED', 'true')
+    after = _run(intake, landing)
+    assert before[0] == after[0]
+    assert before[1].statements == after[1].statements
+    assert before[2].objects == after[2].objects
+    assert before[3].rows['TRANSACTION'] == after[3].rows['TRANSACTION']
+    assert after[3].rows['person_observation_batch'][0]['rows'] > 0
+
+
+def test_related_sidecar_failure_does_not_fail_customer_route(intake, landing, monkeypatch):
+    original = _Sink.insert_ndjson
+    def fail_observation(self, entity, body):
+        if entity.startswith('person_observation'):
+            raise RuntimeError('observation store unavailable')
+        return original(self, entity, body)
+    monkeypatch.setattr(_Sink, 'insert_ndjson', fail_observation)
+    monkeypatch.setenv('RELATED_OBSERVATIONS_ENABLED', 'true')
+    result, _, _, sink = _run(intake, landing)
+    assert result['status'] == 'intake_processed'
+    assert all(o['status'] != 'FAILED' for o in result['outputs'])
+    assert 'person_observation_batch' not in sink.rows
+
+
+def test_related_observations_include_keyless_names_and_hash_identity_tokens(intake):
+    from person_observation import observations
+    from cdp_intake_mapping import Projector, Transforms
+    mapping = {'version': 2, 'derived_keys': {}, 'projections': [{
+        'name': 'customer', 'target_entity': 'CUSTOMER', 'fields': [
+            {'target_field': 'source_customer_id', 'source_path': 'id'},
+            {'target_field': 'full_name', 'source_path': 'name'},
+            {'target_field': 'external_ids', 'pack': [{'as': 'national_id', 'path': 'nid'}]}]}]}
+    projector = Projector(mapping, Transforms(hmac_key=b'test-only'))
+    row = {'name': 'Keyless Person', 'nid': 'sensitive-identity'}
+    result = projector.project(row)
+    assert not result.records.get('CUSTOMER')
+    record = list(observations(projector, row, result, {}, 1))[0]
+    assert 'sensitive-identity' not in record['payload']
+    assert json.loads(record['payload'])['customer']['full_name'] == 'Keyless Person'

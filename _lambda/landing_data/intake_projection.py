@@ -48,6 +48,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from cdp_intake_mapping import Projector, Transforms, normalize_headers
+from person_observation import ObservationWriter
 
 LOGGER = logging.getLogger()
 DATASET_SEGMENT = "datasets"
@@ -132,9 +133,9 @@ def iter_rows(content: Any, file_format: str) -> tuple[list[str], Iterator[dict[
     """Header plus a lazy row iterator; cells are source text (None for a missing trailing cell),
     headers normalised the same way the API stored them. Blank lines are skipped."""
     content.seek(0)
+    # Python 3.10's SpooledTemporaryFile has no readable() or seekable(); read its underlying file instead.
+    raw = getattr(content, "_file", content) if isinstance(content, tempfile.SpooledTemporaryFile) else content
     if file_format == "csv":
-        # Python 3.10's SpooledTemporaryFile has no readable(); wrap its underlying file instead.
-        raw = getattr(content, "_file", content) if isinstance(content, tempfile.SpooledTemporaryFile) else content
         text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
         reader = csv.reader(text)
         try:
@@ -155,7 +156,7 @@ def iter_rows(content: Any, file_format: str) -> tuple[list[str], Iterator[dict[
     if file_format == "xlsx":
         from openpyxl import load_workbook
 
-        book = load_workbook(content, read_only=True, data_only=True)
+        book = load_workbook(raw, read_only=True, data_only=True)
         sheet = book.worksheets[0]
         values = sheet.iter_rows(values_only=True)
         header_row = next(values, None)
@@ -475,6 +476,8 @@ def process_dataset_object(
     lineage = {"app_id": str(ctx["app_id"]), "source_code": source.source_code,
                "dataset_id": ctx["dataset_id"], "batch_ref": source.batch_ref,
                "mapping_version_id": ctx["mapping_version_id"], "_version": version}
+    observation_writer = ObservationWriter(sink, lineage, source.key,
+        os.getenv("RELATED_OBSERVATIONS_ENABLED", "false").lower() == "true")
     chunk_bytes = INSERT_CHUNK_BYTES
 
     pool = IoPool()
@@ -508,6 +511,7 @@ def process_dataset_object(
         for row_number, row in enumerate(rows, start=1):
             source_rows = row_number
             result = projector.project(row, row_number=row_number)
+            observation_writer.add(projector, row, result, row_number)
             for name, count in result.skipped.items():
                 skipped[entity_of[name]] = skipped.get(entity_of[name], 0) + count
             for rej in result.rejects:
@@ -532,6 +536,7 @@ def process_dataset_object(
                     written[entity] += 1
                 if len(buf) >= chunk_bytes:
                     flush(entity)
+        observation_writer.close()
         parsed = clock()
         for entity in facts:
             flush(entity)
