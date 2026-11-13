@@ -2,16 +2,22 @@
 
 Shared intake mapping engine (mapping v2 projections) for upload landing and connector."""
 
-from .contracts import (CANONICAL_VALUES, ENTITY_FIELDS, ENTITY_KEY, ENTITY_REQUIRED,
-                        MASTER_ENTITIES, PERSON_FACTS)
+from .contracts import (
+    CANONICAL_VALUES,
+    ENTITY_FIELDS,
+    ENTITY_KEY,
+    ENTITY_REQUIRED,
+    MASTER_ENTITIES,
+    PERSON_FACTS,
+)
 from .engine import (
     MappingError,
     ProjectionResult,
     Projector,
     finish_record,
     normalize_headers,
-    required_groups,
     referenced_paths,
+    required_groups,
     validate_mapping,
 )
 from .transforms import TransformError, Transforms

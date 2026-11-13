@@ -32,8 +32,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .contracts import (CANONICAL_VALUES, ENTITY_FIELDS, ENTITY_KEY, ENTITY_REQUIRED, JSON_FIELDS,
-                        NODE_TYPES)
+from .contracts import (
+    CANONICAL_VALUES,
+    ENTITY_FIELDS,
+    ENTITY_KEY,
+    ENTITY_REQUIRED,
+    JSON_FIELDS,
+    NODE_TYPES,
+)
 from .transforms import TransformError, Transforms, clean
 
 VALUE_SOURCES = ("source_path", "constant", "derived_key", "template", "pack", "coalesce")
@@ -145,7 +151,7 @@ def validate_mapping(mapping: dict, transforms: Transforms | None = None) -> lis
             if entity != "TRANSACTION" or group_by != "source_transaction_id":
                 errors.append(f"{pname}: group_by is only for TRANSACTION on source_transaction_id")
             elif not any(p.get("target_entity") == "TRANSACTION_ITEM" for p in projections):
-                errors.append(f"{pname}: group_by needs a TRANSACTION_ITEM projection for the lines")
+                errors.append(f"{pname}: group_by needs a TRANSACTION_ITEM projection for lines")
         unsupported = sorted(set(targets) - ENTITY_FIELDS[entity])
         if unsupported:
             errors.append(f"{pname}: unsupported {entity.lower()} fields {unsupported}")
