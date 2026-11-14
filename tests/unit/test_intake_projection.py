@@ -456,3 +456,24 @@ def test_rows_superseded_after_insert_do_not_fail_the_file(intake, landing):
         customer_columns=landing.CSV_COLUMNS, hmac_secret=b"t", sink=Shrinking(), clock=lambda: 1_760_000_000.0)
     out = {o["target_entity"]: o for o in result["outputs"]}
     assert out["PRODUCT"]["status"] == "LOADED" and out["PRODUCT"]["output_rows"] == 3
+
+
+def test_finalize_retries_a_busy_clickhouse(intake, monkeypatch):
+    import urllib.error
+    calls = []
+    sink = intake.ClickHouseSink({"url": "http://ch:8123", "username": "u", "password": "p"})
+    def post(query, body=None):
+        calls.append(query)
+        if len(calls) < 3:
+            raise urllib.error.HTTPError("http://ch", 500, "err", {}, io.BytesIO(b"Code: 241. DB::Exception: memory limit exceeded"))
+        return ""
+    monkeypatch.setattr(sink, "_post", post)
+    monkeypatch.setattr(intake.time, "sleep", lambda s: None)
+    sink.run("INSERT ...")
+    assert len(calls) == 3
+    calls.clear()
+    def bad(query, body=None):
+        raise urllib.error.HTTPError("http://ch", 500, "err", {}, io.BytesIO(b"Code: 62. Syntax error"))
+    monkeypatch.setattr(sink, "_post", bad)
+    with pytest.raises(RuntimeError, match="Code: 62"):
+        sink.run("INSERT ...")

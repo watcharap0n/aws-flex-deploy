@@ -477,8 +477,20 @@ class ClickHouseSink:
                  f"toUUID('{dataset_id}') AND batch_ref = '{batch_ref}' AND _version IN ({wanted})")
         return int(self._post(query + " FORMAT TSVRaw").strip() or 0)
 
-    def run(self, query: str) -> str:
-        return self._post(query)
+    def run(self, query: str, attempts: int = 4) -> str:
+        """For the end-of-file builds. A memory-limit error (code 241) on a busy server is retried:
+        re-inserting the same rows with the same _version changes nothing."""
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._post(query)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "replace")[:400]
+                if "Code: 241" in body and attempt < attempts:
+                    LOGGER.warning("clickhouse_memory_retry attempt=%d", attempt)
+                    time.sleep(5 * attempt * attempt)
+                    continue
+                raise RuntimeError(f"ClickHouse {exc.code}: {body}") from exc
+        raise RuntimeError("unreachable")
 
     def scalar(self, query: str) -> int:
         return int(self._post(query + " FORMAT TSVRaw").strip() or 0)
