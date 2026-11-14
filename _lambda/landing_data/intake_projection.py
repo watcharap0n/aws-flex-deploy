@@ -461,11 +461,14 @@ class ClickHouseSink:
         if chunk:
             self._post(query, b"".join(chunk))
 
-    def insert_ndjson(self, entity: str, body: bytes) -> None:
-        """Insert pre-encoded JSONEachRow lines (one body <= INSERT_CHUNK_BYTES). Keys outside the
-        table are skipped by input_format_skip_unknown_fields, so lineage lines can be sent as-is."""
-        if body:
-            self._post(f"INSERT INTO cdp_intake.{entity.lower()} FORMAT JSONEachRow", body)
+    def insert_ndjson(self, entity: str, body: bytes) -> int:
+        """Insert pre-encoded JSONEachRow lines (one body <= INSERT_CHUNK_BYTES) and return how many
+        lines ClickHouse acknowledged. Keys outside the table are skipped by
+        input_format_skip_unknown_fields, so lineage lines can be sent as-is."""
+        if not body:
+            return 0
+        self._post(f"INSERT INTO cdp_intake.{entity.lower()} FORMAT JSONEachRow", body)
+        return body.count(b"\n")
 
     def count(self, entity: str, dataset_id: str, batch_ref: str, version: int,
               versions: tuple[int, ...] = ()) -> int:
@@ -645,18 +648,17 @@ def process_dataset_object(
                         status.update(_hand_off_customers(customers, status, source, ctx, input_prefix,
                                                           s3_client, pool))
                     else:
-                        for future in inserts[entity]:
-                            future.result()
+                        # Verified by ClickHouse's acknowledgement of every chunk. A count() read back
+                        # later is not a check: these tables keep the newest row per key, so a merge or
+                        # a newer file with the same keys legitimately leaves fewer rows of this version.
+                        acked = sum(int(future.result() or 0) for future in inserts[entity])
                         writers[entity].close()
                         if entity in finalize_error:
                             raise finalize_error[entity]
+                        if acked != written[entity]:
+                            raise RuntimeError(f"ClickHouse acknowledged {acked} of {written[entity]} rows")
                         expected = bills_expected if entity == "TRANSACTION" and entity in staged \
                             else written[entity]
-                        if written[entity]:
-                            extra = (version + MASTER_RANK,) if entity in MASTER_ENTITIES else ()
-                            loaded = sink.count(entity, ctx["dataset_id"], source.batch_ref, version, extra)
-                            if loaded != expected:
-                                raise RuntimeError(f"ClickHouse has {loaded} of {expected} rows")
                         status.update(route="cdp_intake", status="LOADED", output_rows=expected,
                                       output_key=writers[entity].key)
                 except Exception as exc:

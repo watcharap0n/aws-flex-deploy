@@ -143,7 +143,9 @@ class _Sink:
         self.rows.setdefault(entity, []).extend(rows)
 
     def insert_ndjson(self, entity, body):
-        self.rows.setdefault(entity, []).extend(json.loads(line) for line in body.decode().splitlines())
+        lines = [json.loads(line) for line in body.decode().splitlines()]
+        self.rows.setdefault(entity, []).extend(lines)
+        return len(lines)
 
     def count(self, entity, dataset_id, batch_ref, version, versions=()):
         wanted = {version, *versions}
@@ -435,3 +437,22 @@ def test_connector_dataset_with_mapping_v2_is_accepted(intake, landing):
     result, conn, s3, sink = _run(intake, landing, definition_key="mongodb", body=LINES_CSV,
                                   mapping=_lines_mapping())
     assert result["status"] == "intake_processed"
+
+
+def test_rows_superseded_after_insert_do_not_fail_the_file(intake, landing):
+    """A merge or a newer file can leave fewer rows of this version; the insert acknowledgement counts."""
+    class Shrinking(_Sink):
+        def count(self, *args, **kwargs):
+            return 1
+    mapping = {"version": 2, "projections": [{"name": "catalog", "target_entity": "PRODUCT", "fields": [
+        {"target_field": "sku", "source_path": "sku"}]}]}
+    conn = _Connection((DATASET_ID, "578dce72-9575-4fda-851c-ff123826a906", "MULTI", "pos", "file_upload",
+                        "990008", "a15cc080-6de5-46c7-9033-71f7c0eb5083", "PUBLISHED", mapping))
+    source = types.SimpleNamespace(bucket="b", source_code="pos", batch_ref=BATCH_REF, dataset_id=DATASET_ID,
+                                   file_format="csv", key=f"data_sources/pos/{BATCH_REF}/datasets/{DATASET_ID}/p.csv")
+    result = intake.process_dataset_object(
+        source=source, downloaded=types.SimpleNamespace(content=io.BytesIO(b"sku\nP1\nP2\nP3\n"), etag="e"),
+        connection=conn, s3_client=_S3(), output_bucket="b", output_root_prefix="raw/", input_prefix="data_sources/",
+        customer_columns=landing.CSV_COLUMNS, hmac_secret=b"t", sink=Shrinking(), clock=lambda: 1_760_000_000.0)
+    out = {o["target_entity"]: o for o in result["outputs"]}
+    assert out["PRODUCT"]["status"] == "LOADED" and out["PRODUCT"]["output_rows"] == 3
