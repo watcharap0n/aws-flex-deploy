@@ -70,7 +70,8 @@ COUPON_FIELDS = frozenset({
     "source_coupon_id", "name", "benefit_type", "benefit_value", "min_spend", "valid_from",
     "valid_to", "quota", "source_campaign_id", "conditions", "status", "attributes",
 })
-# Stock on hand of one product at one location on one day (a snapshot), optionally per lot. Not person-linked.
+# Stock on hand of one product at one location on one day (a snapshot), optionally per lot.
+# Not person-linked.
 STOCK_BALANCE_FIELDS = frozenset({
     "sku", "location_id", "as_of", "quantity", "lot_id", "received_at", "expiry_date",
     "warranty_end", "unit_cost", "status", "attributes",

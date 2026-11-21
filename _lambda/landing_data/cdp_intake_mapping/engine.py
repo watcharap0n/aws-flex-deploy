@@ -232,7 +232,8 @@ def finish_record(entity: str, record: dict) -> None:
     elif entity == "POINT_BALANCE":
         record.setdefault("program", "default")
     elif entity == "STOCK_BALANCE":
-        # A stock file without a location counts for the brand as a whole; without lots, one row per product.
+        # A stock file without a location counts for the brand as a whole; without lots, one
+        # row per product.
         record.setdefault("location_id", "")
         record.setdefault("lot_id", "")
     elif entity == "COUPON_WALLET":
