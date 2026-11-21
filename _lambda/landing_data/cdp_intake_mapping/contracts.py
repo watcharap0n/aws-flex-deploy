@@ -70,6 +70,11 @@ COUPON_FIELDS = frozenset({
     "source_coupon_id", "name", "benefit_type", "benefit_value", "min_spend", "valid_from",
     "valid_to", "quota", "source_campaign_id", "conditions", "status", "attributes",
 })
+# Stock on hand of one product at one location on one day (a snapshot), optionally per lot. Not person-linked.
+STOCK_BALANCE_FIELDS = frozenset({
+    "sku", "location_id", "as_of", "quantity", "lot_id", "received_at", "expiry_date",
+    "warranty_end", "unit_cost", "status", "attributes",
+})
 COUPON_WALLET_FIELDS = frozenset({
     "source_wallet_id", "source_customer_id", "source_coupon_id", "coupon_code", "status",
     "issued_at", "status_at", "redeemed_at", "expires_at", "source_transaction_id", "location_id",
@@ -91,6 +96,7 @@ ENTITY_FIELDS = {
     "POINT_BALANCE": POINT_BALANCE_FIELDS,
     "COUPON": COUPON_FIELDS,
     "COUPON_WALLET": COUPON_WALLET_FIELDS,
+    "STOCK_BALANCE": STOCK_BALANCE_FIELDS,
 }
 # Each inner tuple means "at least one of".
 ENTITY_REQUIRED = {
@@ -110,6 +116,7 @@ ENTITY_REQUIRED = {
     "POINT_BALANCE": (("source_customer_id",), ("balance",), ("as_of",)),
     "COUPON": (("source_coupon_id",),),
     "COUPON_WALLET": (("source_customer_id",), ("source_coupon_id",), ("status",)),
+    "STOCK_BALANCE": (("sku",), ("quantity",), ("as_of",)),
 }
 ENTITY_KEY = {
     "CUSTOMER": "source_customer_id",
@@ -126,6 +133,7 @@ ENTITY_KEY = {
     "POINT_BALANCE": "source_customer_id",  # + program, as_of
     "COUPON": "source_coupon_id",
     "COUPON_WALLET": "source_customer_id",  # + source_wallet_id (derived when not mapped)
+    "STOCK_BALANCE": "sku",  # + location_id, lot_id, as_of
 }
 # Facts that attach to a person by source_customer_id and never create one.
 PERSON_FACTS = frozenset({"TRANSACTION", "EVENT", "CONSENT", "POINT_LEDGER", "POINT_BALANCE",
